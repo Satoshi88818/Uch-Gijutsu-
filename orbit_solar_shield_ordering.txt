@@ -1,0 +1,22 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import sys; sys.path.insert(0,'.')
+from uchu import *
+from uchu.config import OrbitalConfig, OrbitType, SolarActivity
+from uchu.orbit import OrbitalEnvironment, FlareSchedule
+from uchu.radiation import RadiationEnvironment
+def env(ot=OrbitType.LEO, alt=None, inc=51.6, sol=SolarActivity.MODERATE, shield=2.0):
+    c=SimConfig(); c.orbital=OrbitalConfig.for_orbit(ot, inclination_deg=inc, solar_activity=sol)
+    if alt: c.orbital.altitude_km=alt
+    c.radiation.shield_mm_al=shield
+    o=OrbitalEnvironment(c.orbital); o.flares=FlareSchedule.from_events([])
+    return RadiationEnvironment(c.validate(),o)
+for name,e in [("LEO550",env()),("LEO1000",env(alt=1000)),("LEO400",env(alt=400)),("MEO",env(OrbitType.MEO)),("GEO",env(OrbitType.GEO)),("DEEP",env(OrbitType.DEEP)),("LEO polar",env(inc=97)),("LEO eq",env(inc=0.1))]:
+    print(f"{name:10s} sram/bit/day={e.static_rate['sram']*86400:.3e} sep_coeff={e.sep_coeff['sram']:.3e}")
+for s in SolarActivity: print(s, env(OrbitType.DEEP,sol=s).static_rate['sram']*86400)
+print("shield0",env(shield=0).static_rate['sram']*86400,"shield20",env(shield=20).static_rate['sram']*86400)
+e=env(); print({k:{kk:f'{vv:.2e}' for kk,vv in v.items()} for k,v in e.base.items()})
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"LEO550     sram/bit/day=2.685e-10 sep_coeff=1.838e-14\nLEO1000    sram/bit/day=2.701e-09 sep_coeff=1.838e-14\nLEO400     sram/bit/day=1.351e-10 sep_coeff=1.838e-14\nMEO        sram/bit/day=1.013e-07 sep_coeff=3.260e-14\nGEO        sram/bit/day=3.425e-12 sep_coeff=3.623e-14\nDEEP       sram/bit/day=4.929e-14 sep_coeff=3.623e-14\nLEO polar  sram/bit/day=2.685e-10 sep_coeff=3.546e-14\nLEO eq     sram/bit/day=2.685e-10 sep_coeff=1.811e-15\nSolarActivity.LOW 7.041753912069788e-14\nSolarActivity.MODERATE 4.929227738448851e-14\nSolarActivity.HIGH 3.168789260431405e-14\nshield0 3.27934878823777e-10 shield20 4.4402779743559326e-11\n{'sram': {'gcr': '8.15e-19', 'trapped': '4.77e-15', 'sep_ion': '2.05e-17', 'sep_p': '4.42e-14'}, 'register': {'gcr': '1.63e-18', 'trapped': '4.77e-15', 'sep_ion': '4.11e-17', 'sep_p': '4.42e-14'}, 'logic_set': {'gcr': '4.25e-20', 'trapped': '1.29e-16', 'sep_ion': '4.19e-19', 'sep_p': '9.39e-16'}, 'sel': {'gcr': '2.88e-10', 'trapped': '0.00e+00', 'sep_ion': '0.00e+00', 'sep_p': '0.00e+00'}}\n","stderr":""}
