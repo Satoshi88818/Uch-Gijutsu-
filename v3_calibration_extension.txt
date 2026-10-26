@@ -1,0 +1,214 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import re
+# ---------------- config.py ----------------
+p='uchu/config.py'; s=open(p).read()
+s=s.replace("""import copy
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Optional
+""","""import copy
+import dataclasses
+import hashlib
+import json
+import math
+import typing
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+""")
+s=s.replace("""    ecc_bw_overhead_pct: float = 12.5       # PLACEHOLDER
+""","""    ecc_bw_overhead_pct: float = 12.5       # PLACEHOLDER
+    hbm_efficiency: float = 1.0             # PLACEHOLDER: achieved / peak HBM bandwidth (excl. ECC overhead)
+""")
+s=s.replace("""    eclipse_fraction_override: Optional[float] = None
+
+    @classmethod""","""    eclipse_fraction_override: Optional[float] = None
+    # SEP-event statistics.  None / defaults reproduce the v3.0 built-in table.   PLACEHOLDER until fitted
+    sep_events_per_year: Optional[float] = None
+    sep_mean_duration_s: float = 12 * 3600.0
+    sep_intensity_median: float = 1.0          # relative to the reference event embodied in the SEP spectra
+    sep_intensity_log_sigma: float = 1.0
+
+    @classmethod""")
+s=s.replace("""@dataclass
+class RadiationConfig:""","""@dataclass
+class SpectrumTable:
+    \"\"\"Integral flux table Phi(>x) [particles/cm2/s] vs x (LET [MeV cm2/mg] or E [MeV]) from CREME96/OMERE/SPENVIS.\"\"\"
+    x: List[float]
+    phi_integral: List[float]
+
+
+_SPECTRUM_KEYS = ("gcr_ion", "trapped_proton", "sep_ion", "sep_proton")
+
+
+@dataclass
+class RadiationConfig:""")
+s=s.replace("""    let_grid_lo: float = 1e-2""","""    # 'scaled_placeholder': power-law spectra x placeholder orbit scalings.
+    # 'tabulated_orbit'   : `tables` are orbit-specific & already shielded; NO scalings are applied.
+    environment_mode: str = "scaled_placeholder"
+    tables: Dict[str, SpectrumTable] = field(default_factory=dict)
+    let_grid_lo: float = 1e-2""")
+s=s.replace("""    mbu_max_cluster: int = 6
+""","""    mbu_max_cluster: int = 6
+    mbu_cluster_geom_p: float = 0.5          # PLACEHOLDER: P(stop) of the truncated-geometric cluster size
+""")
+s=s.replace("""    random_seed: int = 42
+
+    # ------------------------------------------------------------------
+    def validate""","""    random_seed: int = 42
+    calibration: Dict[str, dict] = field(default_factory=dict)   # dotted path -> provenance entry
+
+    # ------------------------------------------------------------------
+    def validate""")
+s=s.replace("""        need(0.0 <= c.pipeline_overlap <= 1.0, "pipeline_overlap in [0,1]")
+""","""        need(0.0 <= c.pipeline_overlap <= 1.0, "pipeline_overlap in [0,1]")
+        need(0.0 < m.hbm_efficiency <= 1.0, "hbm_efficiency in (0,1]")
+        need(0.0 < r.mbu_cluster_geom_p <= 1.0, "mbu_cluster_geom_p in (0,1]")
+        need(r.environment_mode in ("scaled_placeholder", "tabulated_orbit"), "unknown environment_mode")
+        need(o.sep_mean_duration_s > 0 and o.sep_intensity_median > 0 and o.sep_intensity_log_sigma >= 0,
+             "SEP statistics must be positive")
+        need(o.sep_events_per_year is None or o.sep_events_per_year >= 0, "sep_events_per_year >= 0")
+        for key, tab in r.tables.items():
+            need(key in _SPECTRUM_KEYS, f"unknown spectrum table '{key}'")
+            xs_, ph_ = np.asarray(tab.x, float), np.asarray(tab.phi_integral, float)
+            need(len(xs_) >= 2 and len(xs_) == len(ph_), f"table '{key}' needs >= 2 matched points")
+            need(bool(np.all(np.diff(xs_) > 0) and np.all(xs_ > 0)), f"table '{key}': x must be positive ascending")
+            need(bool(np.all(ph_ >= 0) and np.all(np.diff(ph_) <= 0)), f"table '{key}': flux must be >= 0, non-increasing")
+        need(r.environment_mode != "tabulated_orbit" or len(r.tables) > 0, "tabulated_orbit needs at least one table")
+""")
+s=s.replace("""    def config_hash(self) -> str:
+        return hashlib.sha256(self.to_json(indent=0).encode()).hexdigest()[:16]""","""    def config_hash(self) -> str:
+        return hashlib.sha256(self.to_json(indent=0).encode()).hexdigest()[:16]
+
+    # ---- round trip -------------------------------------------------------
+    @classmethod
+    def from_dict(cls, d: dict) -> "SimConfig":
+        return _dc_from_dict(cls, d)
+
+    @classmethod
+    def from_json(cls, text: str) -> "SimConfig":
+        return cls.from_dict(json.loads(text))"""
+)
+s+='''
+
+# ---------------------------------------------------------------------------
+# Generic dict -> dataclass reconstruction (enums, nested dataclasses, Optional, Dict, List)
+# ---------------------------------------------------------------------------
+def _build(tp, val):
+    if val is None:
+        return None
+    origin, args = typing.get_origin(tp), typing.get_args(tp)
+    if dataclasses.is_dataclass(tp):
+        return _dc_from_dict(tp, val)
+    if isinstance(tp, type) and issubclass(tp, Enum):
+        return tp[val.split(".")[-1]] if isinstance(val, str) else tp(val)
+    if origin is typing.Union:
+        inner = [a for a in args if a is not type(None)]
+        return _build(inner[0], val)
+    if origin in (dict, Dict):
+        return {k: _build(args[1], v) for k, v in val.items()}
+    if origin in (list, List):
+        return [_build(args[0], v) for v in val]
+    if tp is float:
+        return float(val)
+    if tp is int:
+        return int(val)
+    return val
+
+
+def _dc_from_dict(cls, d: dict):
+    hints = typing.get_type_hints(cls)
+    names = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(d) - names
+    if unknown:
+        raise ValueError(f"{cls.__name__}: unknown field(s) {sorted(unknown)}")
+    return cls(**{k: _build(hints[k], v) for k, v in d.items()})
+'''
+open(p,'w').write(s)
+
+# ---------------- memory.py: hbm efficiency ----------------
+p='uchu/memory.py'; s=open(p).read()
+s=s.replace("    return m.hbm_bw_tb_s_per_stack * 1e12 * m.num_hbm_stacks * eff","    return m.hbm_bw_tb_s_per_stack * 1e12 * m.num_hbm_stacks * eff * m.hbm_efficiency")
+open(p,'w').write(s)
+
+# ---------------- orbit.py: SEP statistics from config ----------------
+p='uchu/orbit.py'; s=open(p).read()
+s=s.replace("""    def __init__(self, rate_per_s: float, rng: Optional[np.random.Generator],
+                 mean_duration_s: float = SEP_MEAN_DURATION_S,
+                 log_sigma: float = SEP_INTENSITY_LOGSIGMA):
+        self.rate = rate_per_s""","""    def __init__(self, rate_per_s: float, rng: Optional[np.random.Generator],
+                 mean_duration_s: float = SEP_MEAN_DURATION_S,
+                 log_sigma: float = SEP_INTENSITY_LOGSIGMA, median: float = 1.0):
+        self.rate = rate_per_s
+        self.median = median""")
+s=s.replace("inten = float(self.rng.lognormal(0.0, self.log_sigma))","inten = float(self.rng.lognormal(math.log(self.median), self.log_sigma))")
+s=s.replace("""        rate = SEP_EVENTS_PER_YEAR[cfg.solar_activity] / (365.25 * 86400.0)
+        self.flares = FlareSchedule(rate, rng if rng is not None else np.random.default_rng(0))""","""        per_year = (cfg.sep_events_per_year if cfg.sep_events_per_year is not None
+                    else SEP_EVENTS_PER_YEAR[cfg.solar_activity])
+        self.flares = FlareSchedule(per_year / (365.25 * 86400.0),
+                                    rng if rng is not None else np.random.default_rng(0),
+                                    mean_duration_s=cfg.sep_mean_duration_s,
+                                    log_sigma=cfg.sep_intensity_log_sigma, median=cfg.sep_intensity_median)""")
+open(p,'w').write(s)
+
+# ---------------- radiation.py: tables / modes / geom p ----------------
+p='uchu/radiation.py'; s=open(p).read()
+old=s[s.index("        geo = geomagnetic_transmission(o.orbit_type, o.inclination_deg)"):s.index("    def rate_per_unit_s")]
+new='''        tabulated = rc.environment_mode == "tabulated_orbit"
+        if tabulated:        # orbit-specific, already-shielded tables: no placeholder scalings
+            geo = solar = trapped = p_shield = 1.0
+        else:
+            geo = geomagnetic_transmission(o.orbit_type, o.inclination_deg)
+            solar = _SOLAR_GCR_MOD[o.solar_activity]
+            trapped = trapped_proton_factor(o.orbit_type, o.altitude_km)
+            p_shield = math.exp(-rc.shield_mm_al / rc.shield_atten_len_mm)
+        self.scalars = {"geo": geo, "solar_gcr": solar, "trapped": trapped, "proton_shield": p_shield}
+
+        spec = {}
+        for k in ("gcr_ion", "trapped_proton", "sep_ion", "sep_proton"):
+            if k in rc.tables:
+                spec[k] = TabulatedSpectrum(rc.tables[k].x, rc.tables[k].phi_integral)
+            elif tabulated:
+                spec[k] = None                      # component absent from the orbit-specific tables => zero flux
+            else:
+                spec[k] = TruncatedPowerLaw(**vars(getattr(rc, k)))
+
+        def _rate(cs, key, lo):
+            return 0.0 if spec[key] is None else integral_rate(cs, spec[key], lo, extra_nodes=[cs.x_th])
+
+        self.base: Dict[str, Dict[str, float]] = {}
+        self.static_rate: Dict[str, float] = {}     # events / unit / s outside SEP events
+        self.sep_coeff: Dict[str, float] = {}       # events / unit / (intensity * s)
+        for name in self.REGIONS:
+            xs = getattr(rc, name)
+            comp = {
+                "gcr": _rate(xs.ion, "gcr_ion", rc.let_grid_lo),
+                "trapped": _rate(xs.proton, "trapped_proton", rc.energy_grid_lo),
+                "sep_ion": _rate(xs.ion, "sep_ion", rc.let_grid_lo),
+                "sep_p": _rate(xs.proton, "sep_proton", rc.energy_grid_lo),
+            }
+            self.base[name] = comp
+            self.static_rate[name] = comp["gcr"] * geo * solar + comp["trapped"] * trapped * p_shield
+            self.sep_coeff[name] = (comp["sep_ion"] + comp["sep_p"] * p_shield) * geo
+
+'''
+s=s.replace(old,new)
+s=s.replace("return 2 + np.minimum(self.rng.geometric(0.5, size=n) - 1, m - 2)","return 2 + np.minimum(self.rng.geometric(self.rc.mbu_cluster_geom_p, size=n) - 1, m - 2)")
+open(p,'w').write(s)
+EOF
+python3 -m pytest -q -p no:cacheprovider 2>&1 | tail -4
+python3 - <<'EOF'
+import sys; sys.path.insert(0,'/home/squire/uchu_v3')
+from uchu import *
+from uchu.config import *
+c=SimConfig().validate(); c2=SimConfig.from_dict(c.to_dict()); print("roundtrip default:", c.config_hash()==c2.config_hash())
+c.orbital=OrbitalConfig.for_orbit(OrbitType.GEO, solar_activity=SolarActivity.HIGH); c.radiation.tables={"gcr_ion":SpectrumTable([0.1,1,10],[1e-2,1e-3,1e-5])}; c.calibration={"a.b":{"x":1}}
+c2=SimConfig.from_json(c.to_json()); print("roundtrip modified:", c.config_hash()==c2.config_hash(), c2.orbital.orbit_type, type(c2.radiation.tables['gcr_ion']).__name__)
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"........................................................................ [ 55%]\n.........................................................                [100%]\nroundtrip default: True\nroundtrip modified: False OrbitType.GEO SpectrumTable\n","stderr":""}
