@@ -1,0 +1,416 @@
+cd /home/squire/uchu_v3 && 
+cat > uchu/radiation.py <<'EOF'
+"""Radiation core (RHBD v4): cross-section x flux physics, word-level ECC, accumulation, scrubbing.
+
+Replaces the v2 model, in which
+  * rates were a single made-up per-bit constant times ad-hoc orbit multipliers,
+  * errors were injected into a 64-element array of zeros (rates independent of the workload),
+  * "SDC" was just the uncorrectable count,
+  * scrubbing declared every upset corrected (no accumulation => no double-bit errors),
+  * flare intensity was sampled but never used, and GCR rose with solar activity (it falls).
+
+Physics implemented here
+  rate/unit = integral sigma(x) * (-dPhi/dx) dx      (x = LET for ions, E for protons)
+  four environment components: GCR ions, trapped protons, SEP ions, SEP protons
+  SRAM: Poisson upsets -> MBU clusters on adjacent physical bits -> bit-interleaved SECDED words
+        -> persistent flipped-bit state until the next scrub -> {corrected, DUE, SDC-candidate}
+  registers / logic (SET): derated by capture probability, AVF and optional TMR
+  SEL: Poisson events -> power-cycle downtime (protected) or destruction (unprotected)
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+import numpy as np
+
+from .config import RadiationConfig, SimConfig, SolarActivity
+from .config import OrbitType
+from .orbit import OrbitalEnvironment
+from .stats import poisson_rate_ci
+
+# ---------------------------------------------------------------------------
+# Spectra and the cross-section integral
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TruncatedPowerLaw:
+    """Integral flux Phi(>x) = phi_ref [ (x/x_ref)^-g - (x_max/x_ref)^-g ]  for x < x_max, else 0."""
+    phi_ref: float
+    x_ref: float
+    gamma: float
+    x_max: float
+
+    def integral(self, x):
+        x = np.asarray(x, dtype=float)
+        v = self.phi_ref * (np.power(np.maximum(x, 1e-300) / self.x_ref, -self.gamma)
+                            - (self.x_max / self.x_ref) ** (-self.gamma))
+        return np.where(x < self.x_max, v, 0.0)
+
+    def differential(self, x):
+        x = np.asarray(x, dtype=float)
+        d = self.gamma * self.phi_ref / self.x_ref * np.power(np.maximum(x, 1e-300) / self.x_ref,
+                                                                 -self.gamma - 1.0)
+        return np.where(x < self.x_max, d, 0.0)
+
+
+class TabulatedSpectrum:
+    """Integral flux from a CREME96/OMERE/SPENVIS export: arrays x (ascending) and Phi(>x)."""
+
+    def __init__(self, x, phi_integral):
+        self.x = np.asarray(x, float)
+        self.phi = np.asarray(phi_integral, float)
+        if np.any(np.diff(self.x) <= 0) or np.any(np.diff(self.phi) > 0):
+            raise ValueError("x must be ascending and Phi(>x) non-increasing")
+        self.x_max = float(self.x[-1])
+
+    def integral(self, x):
+        x = np.asarray(x, float)
+        lx, lp = np.log(self.x), np.log(np.maximum(self.phi, 1e-300))
+        out = np.exp(np.interp(np.log(np.maximum(x, 1e-300)), lx, lp))
+        out = np.where(x < self.x[0], self.phi[0] * (x / self.x[0]) ** -1.0 if False else self.phi[0], out)
+        return np.where(x < self.x_max, out, 0.0)
+
+
+def integral_rate(sigma, spectrum, x_lo: float, x_hi: Optional[float] = None,
+                  n: int = 4000, extra_nodes=()) -> float:
+    """sum_bins sigma(x_mid) * [Phi(x_i) - Phi(x_{i+1})]   (units of sigma x flux: events / unit / s).
+
+    Flux mass per bin is exact (differences of the integral flux); only sigma is sampled.
+    Adding ``extra_nodes`` (e.g. a threshold) makes step cross-sections exact.
+    """
+    x_hi = float(spectrum.x_max if x_hi is None else x_hi)
+    grid = np.geomspace(x_lo, x_hi, n + 1)
+    if len(extra_nodes):
+        ex = np.asarray([e for e in extra_nodes if x_lo < e < x_hi], float)
+        grid = np.unique(np.concatenate([grid, ex]))
+    dphi = spectrum.integral(grid[:-1]) - spectrum.integral(grid[1:])
+    mid = np.sqrt(grid[:-1] * grid[1:])
+    return float(np.sum(sigma(mid) * dphi))
+
+
+# ---------------------------------------------------------------------------
+# Orbit / shielding scalings (PLACEHOLDERS -- replace with CREME96 / AP-9 derived tables)
+# ---------------------------------------------------------------------------
+_SOLAR_GCR_MOD = {SolarActivity.LOW: 1.0, SolarActivity.MODERATE: 0.7, SolarActivity.HIGH: 0.45}
+_TRAPPED_ALT_KM = np.array([200., 400., 600., 800., 1000., 1500., 2000.])
+_TRAPPED_FACTOR = np.array([0.05, 0.4, 1.0, 3.0, 8.0, 40.0, 60.0])   # 1.0 == reference spectrum
+
+
+def geomagnetic_transmission(orbit_type: OrbitType, inclination_deg: float) -> float:
+    if orbit_type == OrbitType.LEO:
+        return 0.05 + 0.95 * abs(math.sin(math.radians(inclination_deg))) ** 3
+    if orbit_type == OrbitType.MEO:
+        return 0.9
+    return 1.0
+
+
+def trapped_proton_factor(orbit_type: OrbitType, altitude_km: float) -> float:
+    if orbit_type == OrbitType.LEO:
+        return float(np.exp(np.interp(altitude_km, _TRAPPED_ALT_KM, np.log(_TRAPPED_FACTOR))))
+    if orbit_type == OrbitType.MEO:
+        return 300.0
+    if orbit_type == OrbitType.GEO:
+        return 0.01
+    return 0.0
+
+
+class RadiationEnvironment:
+    """Time-dependent expected upset counts for each region, from cross-section x flux integrals."""
+
+    REGIONS = ("sram", "register", "logic_set", "sel")
+
+    def __init__(self, cfg: SimConfig, orbit: OrbitalEnvironment):
+        rc: RadiationConfig = cfg.radiation
+        self.orbit = orbit
+        o = cfg.orbital
+        geo = geomagnetic_transmission(o.orbit_type, o.inclination_deg)
+        solar = _SOLAR_GCR_MOD[o.solar_activity]
+        trapped = trapped_proton_factor(o.orbit_type, o.altitude_km)
+        p_shield = math.exp(-rc.shield_mm_al / rc.shield_atten_len_mm)
+        self.scalars = {"geo": geo, "solar_gcr": solar, "trapped": trapped, "proton_shield": p_shield}
+
+        spec = {k: TruncatedPowerLaw(**vars(getattr(rc, k)))
+                for k in ("gcr_ion", "trapped_proton", "sep_ion", "sep_proton")}
+        self.base: Dict[str, Dict[str, float]] = {}
+        self.static_rate: Dict[str, float] = {}     # events / unit / s outside SEP events
+        self.sep_coeff: Dict[str, float] = {}       # events / unit / (intensity * s)
+        for name in self.REGIONS:
+            xs = getattr(rc, name)
+            comp = {
+                "gcr": integral_rate(xs.ion, spec["gcr_ion"], rc.let_grid_lo, extra_nodes=[xs.ion.x_th]),
+                "trapped": integral_rate(xs.proton, spec["trapped_proton"], rc.energy_grid_lo,
+                                         extra_nodes=[xs.proton.x_th]),
+                "sep_ion": integral_rate(xs.ion, spec["sep_ion"], rc.let_grid_lo, extra_nodes=[xs.ion.x_th]),
+                "sep_p": integral_rate(xs.proton, spec["sep_proton"], rc.energy_grid_lo,
+                                       extra_nodes=[xs.proton.x_th]),
+            }
+            self.base[name] = comp
+            self.static_rate[name] = comp["gcr"] * geo * solar + comp["trapped"] * trapped * p_shield
+            self.sep_coeff[name] = (comp["sep_ion"] + comp["sep_p"] * p_shield) * geo
+
+    def rate_per_unit_s(self, region: str, t: float) -> float:
+        return self.static_rate[region] + self.sep_coeff[region] * self.orbit.flare_intensity_at(t)
+
+    def expected(self, region: str, n_units: float, t0: float, t1: float) -> float:
+        """Expected event count for n_units (bits / gates / devices) over [t0, t1], exact in the flare term."""
+        if t1 <= t0 or n_units <= 0:
+            return 0.0
+        return float(n_units) * (self.static_rate[region] * (t1 - t0)
+                                 + self.sep_coeff[region] * self.orbit.flare_intensity_integral(t0, t1))
+
+
+# ---------------------------------------------------------------------------
+# ECC memory with persistent flipped-bit state
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ScrubResult:
+    corrected_words: int = 0
+    due_words: int = 0
+    sdc_words: int = 0
+
+
+class EccMemory:
+    """Sparse flipped-bit set + bit-interleaved SECDED word mapping.
+
+    Physical layout: a row holds ``interleave`` words of ``word_bits`` bits, column-interleaved,
+    so physical column c belongs to word (c mod interleave).  Adjacent physical bits therefore land
+    in different logical words, which is exactly why interleaving defeats multi-bit upsets <= interleave.
+    """
+
+    def __init__(self, word_bits: int = 64, interleave: int = 4, ecc: bool = True,
+                 odd_miscorrect_prob: float = 1.0):
+        self.W, self.I, self.ecc = int(word_bits), int(interleave), bool(ecc)
+        self.p_mis = float(odd_miscorrect_prob)
+        self.state = np.empty(0, dtype=np.int64)
+
+    def word_of(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype=np.int64)
+        row = bits // (self.I * self.W)
+        col = bits % (self.I * self.W)
+        return row * self.I + (col % self.I)
+
+    def inject(self, positions) -> None:
+        """XOR-toggle bits: a bit hit twice returns to its correct value."""
+        pos = np.asarray(positions, dtype=np.int64).ravel()
+        if pos.size == 0:
+            return
+        allp = np.concatenate([self.state, pos])
+        u, c = np.unique(allp, return_counts=True)
+        self.state = u[(c % 2) == 1]
+
+    @property
+    def n_flipped(self) -> int:
+        return int(self.state.size)
+
+    def clear(self) -> None:
+        self.state = np.empty(0, dtype=np.int64)
+
+    def scrub(self, rng: Optional[np.random.Generator] = None) -> ScrubResult:
+        if self.state.size == 0:
+            return ScrubResult()
+        _, counts = np.unique(self.word_of(self.state), return_counts=True)
+        self.clear()
+        if not self.ecc:
+            return ScrubResult(0, 0, int(counts.size))       # every corrupted word is silently wrong
+        corrected = int(np.sum(counts == 1))
+        odd_multi = int(np.sum((counts >= 3) & (counts % 2 == 1)))
+        even_multi = int(np.sum((counts >= 2) & (counts % 2 == 0)))
+        two = int(np.sum(counts == 2))
+        if odd_multi:
+            rng = rng or np.random.default_rng(0)
+            sdc = int(rng.binomial(odd_multi, self.p_mis))
+        else:
+            sdc = 0
+        due = (even_multi) + (odd_multi - sdc)
+        assert two <= even_multi
+        return ScrubResult(corrected, due, sdc)
+
+
+# ---------------------------------------------------------------------------
+# Ledger and immutable statistics
+# ---------------------------------------------------------------------------
+@dataclass
+class RadiationLedger:
+    n_seu_sram: int = 0
+    n_mbu: int = 0
+    n_seu_reg: int = 0
+    n_set_hits: int = 0
+    n_set_latched: int = 0
+    n_sel: int = 0
+    words_corrected: int = 0
+    words_due: int = 0
+    sdc_sram_candidates: int = 0
+    sdc_sram: int = 0
+    sdc_register: int = 0
+    sdc_logic: int = 0
+    downtime_s: float = 0.0
+    destroyed: bool = False
+    destroyed_at_s: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class RadiationStats:
+    elapsed_s: float
+    n_seu_sram: int
+    n_mbu: int
+    n_seu_reg: int
+    n_set_hits: int
+    n_set_latched: int
+    n_sel: int
+    words_corrected: int
+    words_due: int
+    sdc_sram_candidates: int
+    sdc_sram: int
+    sdc_register: int
+    sdc_logic: int
+    downtime_s: float
+    destroyed: bool
+
+    @property
+    def sdc_total(self) -> int:
+        return self.sdc_sram + self.sdc_register + self.sdc_logic
+
+    @property
+    def _hours(self) -> float:
+        return self.elapsed_s / 3600.0
+
+    @property
+    def sdc_per_hr(self) -> float:
+        return self.sdc_total / self._hours if self._hours > 0 else 0.0
+
+    @property
+    def due_per_hr(self) -> float:
+        return self.words_due / self._hours if self._hours > 0 else 0.0
+
+    def sdc_per_hr_ci(self, conf: float = 0.95):
+        return poisson_rate_ci(self.sdc_total, self._hours, conf)
+
+    @property
+    def fit_sdc(self) -> float:
+        """Failures-in-time: SDC events per 1e9 device-hours."""
+        return self.sdc_per_hr * 1e9
+
+    @property
+    def availability(self) -> float:
+        return 1.0 - min(1.0, self.downtime_s / self.elapsed_s) if self.elapsed_s > 0 else 1.0
+
+    def p_no_sdc(self, mission_hours: float) -> float:
+        """P(no SDC during mission_hours) under a constant-rate Poisson model (point estimate)."""
+        return math.exp(-self.sdc_per_hr * mission_hours)
+
+    def p_no_sdc_ci(self, mission_hours: float, conf: float = 0.95):
+        lo, hi = self.sdc_per_hr_ci(conf)
+        return math.exp(-hi * mission_hours), math.exp(-lo * mission_hours)
+
+
+# ---------------------------------------------------------------------------
+# The subsystem that exposes the chip to the environment
+# ---------------------------------------------------------------------------
+class RadiationSubsystem:
+    """Needs only ``env.expected(region, n, t0, t1)``, so tests can inject a stub environment."""
+
+    def __init__(self, cfg: SimConfig, env, rng: np.random.Generator):
+        self.cfg, self.rc, self.env, self.rng = cfg, cfg.radiation, env, rng
+        rc = self.rc
+        A = cfg.compute.array_size
+        self.sram_bits_total = int(cfg.memory.onchip_sram_mb * 2**20 * 8)
+        self.reg_bits = A * A * rc.reg_bits_per_pe
+        self.gates = A * A * rc.gates_per_pe
+        self.mem = EccMemory(rc.ecc_word_bits, rc.ecc_interleave, cfg.memory.ecc_enabled,
+                             rc.secded_odd_miscorrect_prob)
+        self.ledger = RadiationLedger()
+        self._tmr = rc.tmr_residual if rc.tmr_enabled else 1.0
+
+    # ---- helpers -------------------------------------------------------
+    def _cluster_sizes(self, n: int) -> np.ndarray:
+        m = self.rc.mbu_max_cluster
+        return 2 + np.minimum(self.rng.geometric(0.5, size=n) - 1, m - 2)
+
+    def _binom(self, n: int, p: float) -> int:
+        return int(self.rng.binomial(n, min(1.0, max(0.0, p)))) if n > 0 else 0
+
+    # ---- exposure ----------------------------------------------------------
+    def expose(self, t0: float, t1: float, live_sram_bits: float, freq_ghz: float) -> None:
+        if t1 <= t0 or self.ledger.destroyed:
+            return
+        rc, led, rng = self.rc, self.ledger, self.rng
+        live = int(max(1, min(live_sram_bits, self.sram_bits_total)))
+
+        # SRAM: primary hits -> MBU clusters -> persistent flipped state
+        n = int(rng.poisson(self.env.expected("sram", live, t0, t1)))
+        if n:
+            led.n_seu_sram += n
+            prim = rng.integers(0, live, size=n)
+            is_mbu = rng.random(n) < rc.mbu_prob
+            n_mbu = int(is_mbu.sum())
+            led.n_mbu += n_mbu
+            pos = [prim]
+            if n_mbu:
+                reps = self._cluster_sizes(n_mbu) - 1
+                owner = np.repeat(np.arange(n_mbu), reps)
+                within = np.arange(int(reps.sum())) - np.repeat(np.cumsum(reps) - reps, reps) + 1
+                pos.append(np.minimum(prim[is_mbu][owner] + within, self.sram_bits_total - 1))
+            self.mem.inject(np.concatenate(pos))
+
+        # registers: raw flip-flop upsets, derated by AVF (and TMR)
+        n = int(rng.poisson(self.env.expected("register", self.reg_bits, t0, t1)))
+        if n:
+            led.n_seu_reg += n
+            led.sdc_register += self._binom(n, rc.avf_register * self._tmr)
+
+        # SET in combinational logic: must be latched (pulse width x clock), then not masked
+        hits = int(rng.poisson(self.env.expected("logic_set", self.gates, t0, t1)))
+        if hits:
+            led.n_set_hits += hits
+            p_cap = min(1.0, rc.set_pulse_width_ps * 1e-12 * freq_ghz * 1e9)
+            latched = self._binom(hits, p_cap)
+            led.n_set_latched += latched
+            led.sdc_logic += self._binom(latched, rc.avf_logic * self._tmr)
+
+        # SEL: one device
+        n = int(rng.poisson(self.env.expected("sel", 1, t0, t1)))
+        if n:
+            led.n_sel += n
+            if rc.sel_protected:
+                led.downtime_s += n * rc.sel_recovery_s
+                self.mem.clear()                    # power cycle reloads state
+            elif rng.random() < 1.0 - (1.0 - rc.sel_destructive_prob_unprotected) ** n:
+                led.destroyed, led.destroyed_at_s = True, t1
+
+    def scrub(self) -> ScrubResult:
+        res = self.mem.scrub(self.rng)
+        led = self.ledger
+        led.words_corrected += res.corrected_words
+        led.words_due += res.due_words
+        led.sdc_sram_candidates += res.sdc_words
+        led.sdc_sram += self._binom(res.sdc_words, self.rc.avf_sram)
+        return res
+
+    def stats(self, elapsed_s: float) -> RadiationStats:
+        l = self.ledger
+        return RadiationStats(
+            elapsed_s=elapsed_s, n_seu_sram=l.n_seu_sram, n_mbu=l.n_mbu, n_seu_reg=l.n_seu_reg,
+            n_set_hits=l.n_set_hits, n_set_latched=l.n_set_latched, n_sel=l.n_sel,
+            words_corrected=l.words_corrected, words_due=l.words_due,
+            sdc_sram_candidates=l.sdc_sram_candidates, sdc_sram=l.sdc_sram,
+            sdc_register=l.sdc_register, sdc_logic=l.sdc_logic,
+            downtime_s=l.downtime_s, destroyed=l.destroyed)
+EOF
+sed -i 's/        out = np.where(x < self.x\[0\], self.phi\[0\] \* (x \/ self.x\[0\]) \*\* -1.0 if False else self.phi\[0\], out)/        out = np.where(x < self.x[0], self.phi[0], out)/' uchu/radiation.py
+python3 - <<'EOF'
+import sys; sys.path.insert(0,'.')
+from uchu.config import *; from uchu.orbit import *; from uchu.radiation import *
+from uchu.rng import make_rng
+c=SimConfig().validate()
+o=OrbitalEnvironment(c.orbital, make_rng(1,'orbit'))
+e=RadiationEnvironment(c,o)
+for r in e.REGIONS: print(r, e.static_rate[r], e.sep_coeff[r], {k:round(v,3) if v else v for k,v in e.scalars.items()} if r=='sram' else '')
+print("sram /bit/day", e.static_rate['sram']*86400)
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"sram 3.1075798929098952e-15 1.8376137368133734e-14 {'geo': 0.507, 'solar_gcr': 0.7, 'trapped': 0.795, 'proton_shield': 0.819}\nregister 3.107869290498541e-15 1.8386551744158528e-14 \nlogic_set 8.43171543366527e-17 3.9028832009591275e-16 \nsel 1.0240050515431117e-10 0.0 \nsram /bit/day 2.6849490274741493e-10\n","stderr":""}
