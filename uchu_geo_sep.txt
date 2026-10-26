@@ -1,0 +1,426 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/radiation.py'; s=open(p).read()
+s=s.replace("""    if orbit_type == OrbitType.GEO:
+        return 0.01
+    return 0.0""","""    return 0.0          # GEO / deep space: no significant trapped-proton population""")
+open(p,'w').write(s)
+p='uchu/config.py'; s=open(p).read()
+s=s.replace("SpectrumParams(100.0, 10.0, 2.0, 300.0))","SpectrumParams(20.0, 10.0, 2.0, 300.0))")
+open(p,'w').write(s)
+EOF
+cat > tests/test_radiation.py <<'EOF'
+import math
+
+import numpy as np
+import pytest
+from scipy.integrate import quad
+
+from uchu import (EccMemory, RadiationEnvironment, RadiationSubsystem, SimConfig, TruncatedPowerLaw,
+                  integral_rate, make_rng)
+from uchu.config import CrossSection, OrbitalConfig, OrbitType, SolarActivity
+from uchu.orbit import FlareSchedule, OrbitalEnvironment
+from uchu.radiation import RadiationStats, TabulatedSpectrum
+
+LAW = TruncatedPowerLaw(2e-3, 1.0, 1.6, 150.0)
+
+
+# --------------------------------------------------------------------------- spectra & quadrature
+def test_spectrum_is_continuous_to_zero_and_consistent_with_differential():
+    assert LAW.integral(150.0) == 0.0 and LAW.integral(1e3) == 0.0
+    assert LAW.integral(149.999) == pytest.approx(0.0, abs=1e-8)
+    x, h = 3.0, 1e-5
+    num = -(LAW.integral(x + h) - LAW.integral(x - h)) / (2 * h)
+    assert LAW.differential(x) == pytest.approx(float(num), rel=1e-6)
+
+
+def test_total_flux_mass_is_exact():
+    one = lambda x: np.ones_like(x)
+    assert integral_rate(one, LAW, 1e-2) == pytest.approx(float(LAW.integral(1e-2)), rel=1e-12)
+
+
+def test_step_cross_section_is_exact_with_threshold_node():
+    sig = 3e-14
+    for xth in (0.5, 2.0, 17.3, 80.0):
+        step = lambda x, xth=xth: np.where(x > xth, sig, 0.0)
+        got = integral_rate(step, LAW, 1e-2, extra_nodes=[xth])
+        assert got == pytest.approx(sig * float(LAW.integral(xth)), rel=1e-12)
+
+
+def test_weibull_integral_matches_adaptive_quadrature():
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    ref, _ = quad(lambda x: float(cs(x)) * float(LAW.differential(x)), 1e-2, 150.0,
+                  points=[0.5, 1, 5, 20, 50], limit=2000, epsrel=1e-10)
+    got = integral_rate(cs, LAW, 1e-2, extra_nodes=[0.5])
+    assert got == pytest.approx(ref, rel=2e-3)
+
+
+def test_quadrature_converges_with_grid():
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    coarse = integral_rate(cs, LAW, 1e-2, n=500, extra_nodes=[0.5])
+    fine = integral_rate(cs, LAW, 1e-2, n=32000, extra_nodes=[0.5])
+    mid = integral_rate(cs, LAW, 1e-2, n=4000, extra_nodes=[0.5])
+    assert abs(mid - fine) < abs(coarse - fine)
+    assert mid == pytest.approx(fine, rel=1e-3)
+
+
+def test_weibull_cross_section_properties():
+    cs = CrossSection(2e-14, 3.0, 10.0, 2.0)
+    assert cs(3.0) == 0.0 and cs(0.1) == 0.0
+    x = np.linspace(0, 500, 1001)
+    s = cs(x)
+    assert np.all(np.diff(s) >= -1e-30) and s[-1] == pytest.approx(2e-14, rel=1e-6)
+    assert cs(3.0 + 10.0) == pytest.approx(2e-14 * (1 - math.exp(-1.0)))     # z = 1
+
+
+def test_tabulated_spectrum_reproduces_analytic_rate():
+    x = np.geomspace(1e-2, 150.0, 400)
+    tab = TabulatedSpectrum(x, LAW.integral(x))
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    a = integral_rate(cs, LAW, 1e-2, extra_nodes=[0.5])
+    b = integral_rate(cs, tab, 1e-2, extra_nodes=[0.5])
+    assert b == pytest.approx(a, rel=0.03)
+
+
+def test_tabulated_spectrum_validates_input():
+    with pytest.raises(ValueError):
+        TabulatedSpectrum([1, 2, 3], [1.0, 2.0, 0.5])      # flux must not increase with x
+    with pytest.raises(ValueError):
+        TabulatedSpectrum([2, 1, 3], [3.0, 2.0, 1.0])
+
+
+# --------------------------------------------------------------------------- environment physics
+def _env(ot=OrbitType.LEO, alt=None, inc=51.6, sol=SolarActivity.MODERATE, shield=2.0):
+    c = SimConfig()
+    c.orbital = OrbitalConfig.for_orbit(ot, inclination_deg=inc, solar_activity=sol)
+    if alt:
+        c.orbital.altitude_km = alt
+    c.radiation.shield_mm_al = shield
+    o = OrbitalEnvironment(c.orbital)
+    o.flares = FlareSchedule.from_events([])
+    return RadiationEnvironment(c.validate(), o)
+
+
+def test_default_leo_sram_rate_is_in_sane_range():
+    per_bit_day = _env().static_rate["sram"] * 86400
+    assert 1e-13 < per_bit_day < 1e-7
+
+
+def test_orbit_ordering():
+    r = {k: _env(*a, **kw).static_rate["sram"] for k, (a, kw) in {
+        "leo400": ((), dict(alt=400)), "leo550": ((), {}), "leo1000": ((), dict(alt=1000)),
+        "meo": ((OrbitType.MEO,), {}), "geo": ((OrbitType.GEO,), {}), "deep": ((OrbitType.DEEP,), {})}.items()}
+    assert r["meo"] > r["leo1000"] > r["leo550"] > r["leo400"] > r["geo"]
+    assert r["geo"] == pytest.approx(r["deep"])
+
+
+def test_gcr_anticorrelated_with_solar_activity():
+    d = {s: _env(OrbitType.DEEP, sol=s).static_rate["sram"] for s in SolarActivity}
+    assert d[SolarActivity.LOW] > d[SolarActivity.MODERATE] > d[SolarActivity.HIGH]     # v2 had this backwards
+
+
+def test_geomagnetic_shielding_by_inclination():
+    eq, mid, polar = (_env(inc=i).sep_coeff["sram"] for i in (0.1, 51.6, 97.0))
+    assert eq < mid < polar
+
+
+def test_shielding_reduces_proton_rate():
+    assert _env(shield=20.0).static_rate["sram"] < _env(shield=2.0).static_rate["sram"] < _env(shield=0.0).static_rate["sram"]
+
+
+def test_expected_counts_linear_in_units_and_time_without_flares():
+    e = _env()
+    base = e.expected("sram", 1e6, 0.0, 100.0)
+    assert e.expected("sram", 2e6, 0.0, 100.0) == pytest.approx(2 * base)
+    assert e.expected("sram", 1e6, 50.0, 250.0) == pytest.approx(2 * base)
+    assert e.expected("sram", 0, 0.0, 100.0) == 0.0 and e.expected("sram", 1e6, 5.0, 5.0) == 0.0
+
+
+def test_flare_raises_expected_counts_exactly():
+    e = _env()
+    e.orbit.flares = FlareSchedule.from_events([(100.0, 200.0, 3.0)])
+    st, sep = e.static_rate["sram"], e.sep_coeff["sram"]
+    n = 1e6
+    assert e.expected("sram", n, 0, 100) == pytest.approx(n * st * 100)
+    assert e.expected("sram", n, 100, 200) == pytest.approx(n * (st + 3.0 * sep) * 100)
+    assert e.expected("sram", n, 0, 300) == pytest.approx(n * (st * 300 + 3.0 * sep * 100))
+    assert e.rate_per_unit_s("sram", 150.0) == pytest.approx(st + 3.0 * sep)
+    assert e.sep_coeff["sram"] / e.static_rate["sram"] > 100       # a flare is a large enhancement
+
+
+def test_config_rejects_cross_section_below_integration_grid():
+    c = SimConfig(); c.radiation.sram.ion.x_th = 1e-3
+    with pytest.raises(ValueError):
+        c.validate()
+
+
+# --------------------------------------------------------------------------- ECC memory
+def test_interleaved_word_mapping():
+    m = EccMemory(word_bits=64, interleave=4)
+    assert list(m.word_of(np.array([0, 1, 2, 3, 4, 255, 256, 257]))) == [0, 1, 2, 3, 0, 3, 4, 5]
+
+
+def test_single_flip_corrected_double_due_triple_sdc_quad_due():
+    for flips, expect in [(1, (1, 0, 0)), (2, (0, 1, 0)), (3, (0, 0, 1)), (4, (0, 1, 0))]:
+        m = EccMemory(64, 1)
+        m.inject(np.arange(flips))               # all in word 0 (interleave 1)
+        r = m.scrub(make_rng(0, "x"))
+        assert (r.corrected_words, r.due_words, r.sdc_words) == expect, flips
+        assert m.n_flipped == 0
+
+
+def test_xor_semantics_double_hit_on_same_bit_cancels():
+    m = EccMemory(64, 1)
+    m.inject([10]); m.inject([10])
+    assert m.n_flipped == 0 and m.scrub() == m.scrub()
+
+
+def test_accumulation_across_injects_creates_double_error():
+    m = EccMemory(64, 1)
+    m.inject([5]); m.inject([9])                 # two separate single hits in one word before scrub
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (0, 1)
+
+
+def test_scrub_clears_so_later_hits_do_not_accumulate():
+    m = EccMemory(64, 1)
+    m.inject([5]); m.scrub(); m.inject([9])
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (1, 0)
+
+
+def test_odd_miscorrection_probability_respected():
+    m = EccMemory(64, 1, odd_miscorrect_prob=0.0)
+    m.inject([0, 1, 2]); r = m.scrub(make_rng(0, "p"))
+    assert (r.sdc_words, r.due_words) == (0, 1)
+
+
+def test_no_ecc_every_corrupted_word_is_silent():
+    m = EccMemory(64, 1, ecc=False)
+    m.inject([0, 100, 200]); r = m.scrub()
+    assert (r.corrected_words, r.due_words, r.sdc_words) == (0, 0, 3)
+
+
+def test_interleaving_defeats_adjacent_cluster():
+    for I, expect in [(4, (4, 0, 0)), (1, (0, 1, 0))]:        # 4-bit cluster
+        m = EccMemory(64, I); m.inject(np.arange(100, 104))
+        r = m.scrub(make_rng(0, "i")); assert (r.corrected_words, r.due_words, r.sdc_words) == expect
+    m = EccMemory(64, 2); m.inject(np.arange(0, 3))           # bits 0,1,2 -> words 0,1,0
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (1, 1)
+
+
+@pytest.mark.slow
+def test_double_error_probability_matches_poisson_theory():
+    """Words with exactly 2 hits per scrub interval: n_words * mu^2/2 * exp(-mu) * (63/64)."""
+    rng = make_rng(11, "acc")
+    n_words, mu = 2_000_000, 0.05
+    m = EccMemory(64, 1)
+    k = int(rng.poisson(mu * n_words))
+    m.inject(rng.integers(0, n_words * 64, size=k))
+    r = m.scrub(make_rng(0, "s"))
+    due_exp = n_words * mu ** 2 / 2 * math.exp(-mu) * 63 / 64
+    corr_exp = n_words * mu * math.exp(-mu) * (1 - mu / 64)          # distinct-bit single hits
+    assert r.due_words == pytest.approx(due_exp, rel=0.08)
+    assert r.corrected_words == pytest.approx(corr_exp, rel=0.02)
+
+
+@pytest.mark.slow
+def test_due_rate_proportional_to_scrub_interval():
+    """Fixed exposure: DUE ~ lambda^2 * tau  => doubling the scrub interval doubles DUE."""
+    n_words, lam_w, total = 1_000_000, 0.02, 20.0        # hits / word / s, seconds
+    def due(tau):
+        rng = make_rng(5, "tau", tau)
+        m, d = EccMemory(64, 1), 0
+        for _ in range(int(total / tau)):
+            k = int(rng.poisson(lam_w * tau * n_words))
+            m.inject(rng.integers(0, n_words * 64, size=k))
+            d += m.scrub(make_rng(0, "s")).due_words
+        return d
+    d1, d2 = due(1.0), due(2.0)
+    assert 1.8 < d2 / d1 < 2.15
+
+
+# --------------------------------------------------------------------------- subsystem with a stub environment
+class Stub:
+    def __init__(self, **lam): self.lam = lam
+    def expected(self, region, n, t0, t1): return self.lam.get(region, 0.0) * (t1 - t0)
+
+
+def _sub(cfg=None, seed=0, **lam):
+    cfg = (cfg or SimConfig()).validate()
+    return RadiationSubsystem(cfg, Stub(**lam), make_rng(seed, "rad"))
+
+
+def test_mbu_fraction_and_cluster_size_distribution():
+    s = _sub(sram=2e5)
+    s.expose(0.0, 1.0, 1e9, 1.5)
+    L = s.ledger
+    assert L.n_seu_sram == pytest.approx(2e5, rel=0.02)
+    assert L.n_mbu / L.n_seu_sram == pytest.approx(0.10, abs=0.005)
+    sizes = _sub()._cluster_sizes(200_000)
+    assert sizes.min() == 2 and sizes.max() == 6
+    assert sizes.mean() == pytest.approx(2.9375, abs=0.02)
+
+
+def test_ecc_with_interleave_absorbs_all_mbu_but_without_it_fails():
+    c = SimConfig(); c.radiation.mbu_prob = 1.0; c.radiation.mbu_max_cluster = 4; c.radiation.ecc_interleave = 4
+    s = _sub(c, seed=3, sram=30.0); s.expose(0.0, 1.0, 5e8, 1.5)
+    s.scrub()
+    assert s.ledger.n_mbu == s.ledger.n_seu_sram > 10
+    assert s.ledger.words_due == 0 and s.ledger.sdc_sram == 0
+    assert s.ledger.words_corrected > s.ledger.n_seu_sram         # clusters corrected word by word
+
+    c = SimConfig(); c.radiation.mbu_prob = 1.0; c.radiation.mbu_max_cluster = 4; c.radiation.ecc_interleave = 1
+    s = _sub(c, seed=3, sram=30.0); s.expose(0.0, 1.0, 5e8, 1.5); s.scrub()
+    assert s.ledger.words_due + s.ledger.sdc_sram >= 0.9 * s.ledger.n_mbu
+
+
+def test_register_derating_and_tmr():
+    c = SimConfig(); c.radiation.avf_register = 0.3
+    s = _sub(c, register=1e5); s.expose(0, 1.0, 1e6, 1.5)
+    assert s.ledger.sdc_register == pytest.approx(0.3 * s.ledger.n_seu_reg, rel=0.03)
+    c.radiation.tmr_enabled = True
+    t = _sub(c, register=1e5); t.expose(0, 1.0, 1e6, 1.5)
+    assert t.ledger.sdc_register < 0.01 * s.ledger.sdc_register
+
+
+def test_set_capture_probability_scales_with_clock_frequency_and_saturates():
+    def frac(f, pw=150.0):
+        c = SimConfig(); c.radiation.set_pulse_width_ps = pw
+        s = _sub(c, logic_set=1e5); s.expose(0, 1.0, 1e6, f)
+        return s.ledger.n_set_latched / s.ledger.n_set_hits
+    assert frac(1.5) == pytest.approx(0.225, abs=0.01)
+    assert frac(3.0) == pytest.approx(0.45, abs=0.01)
+    assert frac(1.5, pw=1000.0) == 1.0
+
+
+def test_logic_avf_applied_after_capture():
+    c = SimConfig(); c.radiation.avf_logic = 0.2
+    s = _sub(c, logic_set=2e5); s.expose(0, 1.0, 1e6, 2.0)
+    assert s.ledger.sdc_logic == pytest.approx(0.2 * s.ledger.n_set_latched, rel=0.03)
+
+
+def test_sel_protected_costs_downtime_and_clears_memory():
+    s = _sub(sram=50.0, sel=1000.0)
+    s.expose(0, 1.0, 1e9, 1.5)
+    assert s.ledger.n_sel > 900 and not s.ledger.destroyed
+    assert s.ledger.downtime_s == pytest.approx(5.0 * s.ledger.n_sel)
+    assert s.mem.n_flipped == 0                      # power-cycle reloaded state
+
+
+def test_sel_unprotected_destroys_or_not_per_probability():
+    c = SimConfig(); c.radiation.sel_protected = False
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5); assert s.ledger.destroyed and s.ledger.destroyed_at_s == 1.0
+    c.radiation.sel_destructive_prob_unprotected = 0.0
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5); assert not s.ledger.destroyed
+    c.radiation.sel_destructive_prob_unprotected = 1.0
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5)
+    before = s.stats(1.0); s.expose(1.0, 2.0, 1e6, 1.5)
+    assert s.stats(1.0) == before                    # a destroyed chip accumulates nothing further
+
+
+def test_event_conservation_single_bit_hits_all_corrected():
+    c = SimConfig(); c.radiation.mbu_prob = 0.0
+    s = _sub(c, seed=4, sram=100.0); s.expose(0, 1.0, 5e8, 1.5); s.scrub()
+    assert s.ledger.words_corrected >= s.ledger.n_seu_sram - 2 and s.ledger.words_due <= 1
+
+
+def test_subsystem_is_deterministic_per_seed():
+    def run(seed):
+        s = _sub(seed=seed, sram=1e4, register=1e4, logic_set=1e4)
+        s.expose(0, 1.0, 1e8, 1.5); s.scrub(); return s.stats(1.0)
+    assert run(1) == run(1) and run(1) != run(2)
+
+
+# --------------------------------------------------------------------------- statistics object
+def _stats(**kw):
+    base = dict(elapsed_s=3600.0, n_seu_sram=0, n_mbu=0, n_seu_reg=0, n_set_hits=0, n_set_latched=0,
+                n_sel=0, words_corrected=0, words_due=0, sdc_sram_candidates=0, sdc_sram=0,
+                sdc_register=0, sdc_logic=0, downtime_s=0.0, destroyed=False)
+    base.update(kw); return RadiationStats(**base)
+
+
+def test_stats_rates_ci_and_survival():
+    s = _stats(sdc_sram=10, sdc_register=20, sdc_logic=6, words_due=18, downtime_s=36.0)
+    assert s.sdc_total == 36 and s.sdc_per_hr == 36.0 and s.due_per_hr == 18.0
+    assert s.fit_sdc == pytest.approx(3.6e10)
+    assert s.availability == pytest.approx(0.99)
+    lo, hi = s.sdc_per_hr_ci()
+    assert lo < 36.0 < hi
+    assert s.p_no_sdc(0.0) == 1.0 and s.p_no_sdc(0.01) == pytest.approx(math.exp(-0.36))
+    a, b = s.p_no_sdc_ci(0.01); assert a < s.p_no_sdc(0.01) < b
+
+
+def test_stats_zero_events_has_zero_rate_and_finite_upper_bound():
+    s = _stats()
+    lo, hi = s.sdc_per_hr_ci()
+    assert s.sdc_per_hr == 0.0 and lo == 0.0 and 3.5 < hi < 3.8       # rule of three: ~3.69 / 1 h
+    assert _stats(elapsed_s=0.0).sdc_per_hr == 0.0
+EOF
+cat > tests/test_faults.py <<'EOF'
+import numpy as np
+import pytest
+
+from uchu import flip_bit, measure_gemm_vulnerability
+
+
+def test_int8_two_complement_flips_and_involution():
+    a = np.zeros(4, dtype=np.int8)
+    assert flip_bit(a, 2, 7)[2] == -128 and flip_bit(a, 2, 0)[2] == 1 and flip_bit(a, 2, 6)[2] == 64
+    b = flip_bit(a, 1, 5)
+    assert np.array_equal(flip_bit(b, 1, 5), a)
+    assert a.sum() == 0                                  # input untouched
+
+
+def test_float_flips_follow_ieee754():
+    assert flip_bit(np.array([1.0], np.float32), 0, 31)[0] == -1.0
+    assert np.isinf(flip_bit(np.array([1.0], np.float32), 0, 30)[0])
+    assert flip_bit(np.array([1.0], np.float16), 0, 15)[0] == -1.0
+    assert flip_bit(np.array([1.0], np.float32), 0, 0)[0] == np.nextafter(np.float32(1.0), np.float32(2.0))
+
+
+def test_flip_preserves_shape_and_handles_noncontiguous():
+    a = np.arange(12, dtype=np.int8).reshape(3, 4).T          # non-contiguous view
+    out = flip_bit(a, 5, 0)
+    assert out.shape == a.shape and (out != a).sum() == 1
+
+
+def test_flip_bit_range_checked():
+    with pytest.raises(ValueError):
+        flip_bit(np.zeros(2, np.int8), 0, 8)
+    with pytest.raises(ValueError):
+        flip_bit(np.zeros(2, np.float32), 0, -1)
+
+
+def test_avf_zero_tolerance_is_one_and_monotone_in_tolerance():
+    r0 = measure_gemm_vulnerability(tol=0.0, trials_per_bit=40, seed=1)
+    assert r0.avf == 1.0
+    prev = 1.0
+    for tol in (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e9):
+        r = measure_gemm_vulnerability(tol=tol, trials_per_bit=40, seed=1)
+        assert r.avf <= prev + 1e-12
+        prev = r.avf
+    assert prev == 0.0
+
+
+def test_int8_msb_is_far_more_vulnerable_than_lsb():
+    r = measure_gemm_vulnerability(tol=1e-2, trials_per_bit=80, seed=2)
+    assert r.per_bit_avf[7] > 0.9 and r.per_bit_avf[0] < 0.05
+    assert 0.2 < r.avf < 0.6                                  # roughly the top 3 of 8 bits matter
+    assert r.ci_low <= r.avf <= r.ci_high and r.ci_high - r.ci_low < 0.15
+    assert r.n_trials == 8 * 80
+
+
+def test_float32_exponent_bits_dominate():
+    r = measure_gemm_vulnerability(dtype="float32", tol=1e-2, trials_per_bit=60, seed=3)
+    assert r.per_bit_avf[30] > 0.7 and r.per_bit_avf[0] == 0.0 and r.per_bit_avf[23] < r.per_bit_avf[30]
+
+
+def test_vulnerability_is_reproducible_and_seed_sensitive():
+    a = measure_gemm_vulnerability(trials_per_bit=30, seed=7)
+    b = measure_gemm_vulnerability(trials_per_bit=30, seed=7)
+    c = measure_gemm_vulnerability(trials_per_bit=30, seed=8)
+    assert a == b and a.per_bit_avf != c.per_bit_avf
+EOF
+python3 -m pytest tests/test_radiation.py tests/test_faults.py -q 2>&1 | tail -30
+
+Response:
+
+{"returncode":0,"stdout":"        assert e.expected(\"sram\", n, 0, 300) == pytest.approx(n * (st * 300 + 3.0 * sep * 100))\n        assert e.rate_per_unit_s(\"sram\", 150.0) == pytest.approx(st + 3.0 * sep)\n>       assert e.sep_coeff[\"sram\"] / e.static_rate[\"sram\"] > 100       # a flare is a large enhancement\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nE       assert (3.683558974446578e-15 / 3.1075798929098952e-15) > 100\n\ntests/test_radiation.py:136: AssertionError\n____________ test_vulnerability_is_reproducible_and_seed_sensitive _____________\n\n    def test_vulnerability_is_reproducible_and_seed_sensitive():\n        a = measure_gemm_vulnerability(trials_per_bit=30, seed=7)\n        b = measure_gemm_vulnerability(trials_per_bit=30, seed=7)\n        c = measure_gemm_vulnerability(trials_per_bit=30, seed=8)\n>       assert a == b and a.per_bit_avf != c.per_bit_avf\nE       assert (Vulnerability...240, tol=0.01) == Vulnerability...240, tol=0.01)\nE         \nE         Omitting 6 identical items, use -vv to show and (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, ...) != (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, ...))\nE        +  where (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, ...) = VulnerabilityResult(avf=0.375, ci_low=np.float64(0.31617283473340607), ci_high=np.float64(0.4377656452519836), per_bit_avf=(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0), n_trials=240, tol=0.01).per_bit_avf\nE        +  and   (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, ...) = VulnerabilityResult(avf=0.375, ci_low=np.float64(0.31617283473340607), ci_high=np.float64(0.4377656452519836), per_bit_avf=(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0), n_trials=240, tol=0.01).per_bit_avf\n\ntests/test_faults.py:63: AssertionError\n=============================== warnings summary ===============================\ntests/test_faults.py::test_float32_exponent_bits_dominate\n  /home/squire/uchu_v3/uchu/faults.py:34: RuntimeWarning: invalid value encountered in cast\n    return a.astype(np.float64) @ b.astype(np.float64)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_radiation.py::test_flare_raises_expected_counts_exactly - a...\nFAILED tests/test_faults.py::test_vulnerability_is_reproducible_and_seed_sensitive\n","stderr":""}
