@@ -1,0 +1,21 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import sys; sys.path.insert(0,'.')
+from uchu import *
+c=SimConfig().validate(); F=1.5
+def show(l):
+    p=estimate_layer(l,c,F)
+    print(l.name, l.M,l.K,l.N, l.dtype.label, l.sparsity, "t_c=%.3e t_m=%.3e dur=%.3e mb=%s AI=%.1f ridge=%.1f util=%.3f bytes=%.3e"%(p.t_compute_s,p.t_memory_s,p.duration_s,p.memory_bound,p.arithmetic_intensity,p.ridge_point,p.util,p.hbm_bytes))
+show(WorkloadLayer("gemv","linear",1,8192,8192))
+show(WorkloadLayer("below","linear",8,4096,4096))
+show(WorkloadLayer("above","linear",4096,4096,4096))
+show(WorkloadLayer("d","linear",8192,8192,8192,DType.INT8,0.0))
+show(WorkloadLayer("s","linear",8192,8192,8192,DType.INT8,0.5))
+show(WorkloadLayer("i8","linear",8192,8192,8192,DType.INT8))
+show(WorkloadLayer("f16","linear",8192,8192,8192,DType.FP16))
+import math
+print("tile T int8:", int(math.sqrt(64*2**20/3)))
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"gemv 1 8192 8192 int8 0.0 t_c=1.856e-04 t_m=3.776e-05 dur=1.856e-04 mb=False AI=2.0 ridge=110.6 util=0.004 bytes=6.713e+07\nbelow 8 4096 4096 int8 0.0 t_c=4.913e-05 t_m=9.474e-06 dur=4.913e-05 mb=False AI=15.9 ridge=110.6 util=0.028 bytes=1.684e+07\nabove 4096 4096 4096 int8 0.0 t_c=7.861e-04 t_m=2.831e-05 dur=7.861e-04 mb=False AI=2730.7 ridge=110.6 util=0.889 bytes=5.033e+07\nd 8192 8192 8192 int8 0.0 t_c=5.941e-03 t_m=1.887e-04 dur=5.941e-03 mb=False AI=3276.8 ridge=110.6 util=0.941 bytes=3.355e+08\ns 8192 8192 8192 int8 0.5 t_c=3.372e-03 t_m=1.604e-04 dur=3.372e-03 mb=False AI=2083.8 ridge=110.6 util=0.897 bytes=2.852e+08\ni8 8192 8192 8192 int8 0.0 t_c=5.941e-03 t_m=1.887e-04 dur=5.941e-03 mb=False AI=3276.8 ridge=110.6 util=0.941 bytes=3.355e+08\nf16 8192 8192 8192 fp16 0.0 t_c=1.153e-02 t_m=5.285e-04 dur=1.153e-02 mb=False AI=1170.3 ridge=55.3 util=0.970 bytes=9.395e+08\ntile T int8: 4729\n","stderr":""}
