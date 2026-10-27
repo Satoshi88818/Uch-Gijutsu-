@@ -1,0 +1,61 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/calibration/fit_hardware.py'; s=open(p).read()
+# _covariance with range-scaled conditioning
+s=s.replace('''def _covariance(res, n_obs: int, names: Sequence[str]) -> Tuple[np.ndarray, float, List[str]]:
+    J = res.jac
+    n_par = J.shape[1]
+    dof = max(n_obs - n_par, 1)
+    s2 = float(np.sum(res.fun ** 2) / dof)
+    sv = np.linalg.svd(J, compute_uv=False)''','''def _covariance(res, n_obs: int, names: Sequence[str], scale: Optional[np.ndarray] = None):
+    """Wald covariance from the Jacobian.  Identifiability (condition number / weakest direction) is judged on the
+    Jacobian with each column multiplied by that parameter's plausible range, so it does not depend on units."""
+    J = res.jac
+    n_par = J.shape[1]
+    dof = max(n_obs - n_par, 1)
+    s2 = float(np.sum(res.fun ** 2) / dof)
+    Js = J if scale is None else J * np.asarray(scale)[None, :]
+    sv = np.linalg.svd(Js, compute_uv=False)''')
+s=s.replace("        _, _, vt = np.linalg.svd(J)\n","        _, _, vt = np.linalg.svd(Js)\n")
+# power
+s=s.replace('cov, sig, warn, cond = _covariance(best, len(P), ["ln S (static)", "ln D (dynamic)", "leak_temp_coeff", "clock_frac"])',
+            'cov, sig, warn, cond = _covariance(best, len(P), ["ln S (static)", "ln D (dynamic)", "leak_temp_coeff", "clock_frac"], hi - lo)')
+# thermal
+s=s.replace('cov_f, sig, w2, cond = _covariance(best, len(Tm) - 1, [names[i] for i in free])','cov_f, sig, w2, cond = _covariance(best, len(Tm) - 1, [names[i] for i in free], (hi - lo)[free])')
+# perf: ranges + coarse diff step + range-scaled weak detection
+s=s.replace('''                    r = least_squares(lambda v: resid_for(free_, v), np.clip(p0[idx_], lo[idx_] + 1e-9, hi[idx_] - 1e-9),
+                                      bounds=(lo[idx_], hi[idx_]), x_scale="jac")''','''                    # coarse finite-difference step: cycle counts are ceil()-quantised, so the default 1e-8 step sees a staircase
+                    r = least_squares(lambda v: resid_for(free_, v), np.clip(p0[idx_], lo[idx_] + 1e-9, hi[idx_] - 1e-9),
+                                      bounds=(lo[idx_], hi[idx_]), x_scale="jac", diff_step=1e-3)''')
+s=s.replace('''        cn = np.linalg.norm(best.jac, axis=0)
+        weak = [free[j] for j in range(len(free)) if cn[j] < 1e-6 * max(cn.max(), 1e-300)]''','''        cn = np.linalg.norm(best.jac, axis=0) * (hi - lo)[free + [3]]      # sensitivity over the plausible range
+        weak = [free[j] for j in range(len(free)) if cn[j] < 1e-6 * max(cn.max(), 1e-300)]''')
+s=s.replace('cov_f, sig, w2, cond = _covariance(best, len(lat), [names[i] for i in free] + ["t_launch"])','cov_f, sig, w2, cond = _covariance(best, len(lat), [names[i] for i in free] + ["t_launch"], (hi - lo)[free + [3]])')
+open(p,'w').write(s)
+EOF
+python3 - <<'EOF'
+import sys,time,math; sys.path.insert(0,'/home/squire/uchu_v3')
+import numpy as np
+from uchu import *
+from uchu.calibration.data import *
+from uchu.calibration.fit_hardware import *
+from uchu.memory import WorkloadLayer, estimate_layer
+tr=SimConfig(); tr.memory.hbm_bw_tb_s_per_stack=0.15; tr.compute.pipeline_overlap=0.6; tr.memory.hbm_efficiency=0.72; tr.compute.sparse_speedup_at_50=1.7
+start=SimConfig(); start.memory.hbm_bw_tb_s_per_stack=0.15
+def campaign(shapes,truth,seed):
+    r=make_rng(seed,"c"); out=[]
+    for s in shapes:
+        for f in (1.0,1.5):
+            L=WorkloadLayer("m","g",s["M"],s["K"],s["N"],DType.INT8,s["sparsity"])
+            out.append(PerfMeasurement(s["M"],s["K"],s["N"],s["dtype"],s["sparsity"],f,(estimate_layer(L,truth,f).duration_s+8e-6)*math.exp(r.normal(0,0.02))))
+    return out
+tru={"pipeline_overlap":0.6,"hbm_efficiency":0.72,"sparse_speedup_at_50":1.7}
+for label,sc in (("full design",suggest_gemm_shapes(start)),("design w/o sparse pairs",[x for x in suggest_gemm_shapes(start) if x["sparsity"]==0.0])):
+    t=time.time(); pf=fit_performance(campaign(sc,tr,5),start,make_rng(4,"pf")); print(f"--- {label} ({time.time()-t:.2f}s) fixed={pf.fixed}")
+    for k,v in pf.params.items(): print(f"  {k:22s} fit {v:7.4f} truth {tru[k]:6.3f} CI {tuple(round(x,3) for x in pf.ci95[k])}")
+    print("  t_launch %.2e cond %.1e"%(pf.t_launch_s,pf.cond))
+EOF
+python3 -m pytest -q -p no:cacheprovider -x 2>&1 | tail -2
+
+Response:
+
+{"returncode":0,"stdout":"--- full design (0.17s) fixed=[]\n  pipeline_overlap       fit  0.5868 truth  0.600 CI (0.51, 0.67)\n  hbm_efficiency         fit  0.7043 truth  0.720 CI (0.689, 0.721)\n  sparse_speedup_at_50   fit  1.7089 truth  1.700 CI (1.657, 1.756)\n  t_launch 7.22e-06 cond 5.0e+00\n--- design w/o sparse pairs (0.10s) fixed=['sparse_speedup_at_50']\n  pipeline_overlap       fit  0.5950 truth  0.600 CI (0.527, 0.669)\n  hbm_efficiency         fit  0.7086 truth  0.720 CI (0.694, 0.724)\n  sparse_speedup_at_50   fit  1.8500 truth  1.700 CI (1.85, 1.85)\n  t_launch 7.50e-06 cond 4.9e+00\n........................................................................ [ 55%]\n.........................................................                [100%]\n","stderr":""}
