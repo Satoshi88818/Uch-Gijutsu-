@@ -1,0 +1,28 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import sys,math; sys.path.insert(0,'/home/squire/uchu_v3')
+import numpy as np
+import uchu.calibration.fit_hardware as fh
+from uchu import *
+from uchu.calibration.data import *
+from uchu.memory import WorkloadLayer, estimate_layer
+tr=SimConfig(); tr.memory.hbm_bw_tb_s_per_stack=0.15; tr.compute.pipeline_overlap=0.6; tr.memory.hbm_efficiency=0.72; tr.compute.sparse_speedup_at_50=1.7
+start=SimConfig(); start.memory.hbm_bw_tb_s_per_stack=0.15
+r=make_rng(5,"c"); meas=[]
+for s in fh.suggest_gemm_shapes(start):
+    for f in (1.0,1.5):
+        L=WorkloadLayer("m","g",s["M"],s["K"],s["N"],DType.INT8,s["sparsity"])
+        meas.append(PerfMeasurement(s["M"],s["K"],s["N"],s["dtype"],s["sparsity"],f,(estimate_layer(L,tr,f).duration_s+8e-6)*math.exp(r.normal(0,0.02))))
+print("informative:",fh.regime_counts(meas,start))
+# monkeypatch least_squares to print jac column norms
+orig=fh.least_squares
+def spy(*a,**k):
+    res=orig(*a,**k); 
+    print("  ls: x=",np.round(res.x,4)," colnorm=",np.round(np.linalg.norm(res.jac,axis=0),4)," cost=%.3e"%res.cost); return res
+fh.least_squares=spy
+import io, contextlib
+pf=fh.fit_performance(meas,start,make_rng(4,"pf"))
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"informative: {'pipeline_overlap': 6, 'hbm_efficiency': 18, 'sparse_speedup_at_50': 6}\n  ls: x= [1.     0.701  1.4374 0.    ]  colnorm= [1.63900000e-01 4.63570000e+00 0.00000000e+00 2.62840744e+05]  cost=8.769e-02\n  ls: x= [0.582  0.7043 1.73   0.    ]  colnorm= [8.74600000e-01 4.47070000e+00 0.00000000e+00 2.62811106e+05]  cost=1.742e-02\n  ls: x= [0.535  0.7043 1.9141 0.    ]  colnorm= [8.45200000e-01 4.47070000e+00 0.00000000e+00 2.62709689e+05]  cost=5.273e-02\n  ls: x= [0.5784 0.7043 1.7453 0.    ]  colnorm= [8.7230000e-01 4.4707000e+00 0.0000000e+00 2.6280286e+05]  cost=1.825e-02\n  ls: x= [1.     0.701  1.5425 0.    ]  colnorm= [1.7200000e-01 4.6357000e+00 0.0000000e+00 2.6284116e+05]  cost=3.904e-02\n  ls: x= [0.5389 0.7043 1.9    0.    ]  colnorm= [8.47500000e-01 4.47070000e+00 0.00000000e+00 2.62717634e+05]  cost=4.825e-02\n  ls: x= [0.6471 0.7043 1.4    0.    ]  colnorm= [9.1990000e-01 4.4707000e+00 0.0000000e+00 2.6297373e+05]  cost=1.291e-01\n  ls: x= [0.5389 0.7043 1.9    0.    ]  colnorm= [8.47500000e-01 4.47070000e+00 0.00000000e+00 2.62717726e+05]  cost=4.825e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n  ls: x= [0.5524 0.7043 0.    ]  colnorm= [8.55700000e-01 4.47070000e+00 2.62745708e+05]  cost=3.454e-02\n","stderr":""}
