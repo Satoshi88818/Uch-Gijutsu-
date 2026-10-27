@@ -1,0 +1,27 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/calibration/fit_hardware.py'; s=open(p).read()
+s=s.replace("hi = np.array([1.0, 1.0, 2.0, 0.9 * lat.min()])","hi = np.array([1.0, 1.0, 2.0, 0.999 * lat.min()])      # launch overhead cannot exceed the fastest measurement")
+old='''    at_bound = [names[i] for i in free if min(est[i] - lo[i], hi[i] - est[i]) < 1e-6]
+    if at_bound:'''
+new='''    at_bound = [names[i] for i in free if min(est[i] - lo[i], hi[i] - est[i]) < 1e-6]
+    if est[3] > 0.99 * hi[3]:
+        at_bound.append("t_launch")
+    if at_bound:'''
+assert old in s; s=s.replace(old,new); open(p,'w').write(s)
+EOF
+python3 - <<'EOF'
+import sys,math; sys.path.insert(0,'/home/squire/uchu_v3')
+import numpy as np
+from uchu import *
+from uchu.calibration.fit_hardware import *
+from uchu.calibration.synthetic import *
+truth=make_truth_config(); start=analyst_start_config(truth)
+for noise in (0.0,0.02):
+    f=fit_performance(gen_perf(truth,start,make_rng(5,"c"),log_noise=noise),start,make_rng(4,"f"))
+    print("noise",noise,{k:round(v,5) for k,v in f.params.items()},"t0 %.4e"%f.t_launch_s,"log_rms %.4f"%f.log_rms,"cond %.1f"%f.cond)
+    print("  CI",{k:tuple(round(x,3) for x in c) for k,c in f.ci95.items()})
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"noise 0.0 {'pipeline_overlap': 0.6, 'hbm_efficiency': 0.72, 'sparse_speedup_at_50': 1.69994} t0 8.0000e-06 log_rms 0.0000 cond 4.9\n  CI {'pipeline_overlap': (0.6, 0.6), 'hbm_efficiency': (0.72, 0.72), 'sparse_speedup_at_50': (1.7, 1.7)}\nnoise 0.02 {'pipeline_overlap': 0.60585, 'hbm_efficiency': 0.7143, 'sparse_speedup_at_50': 1.70726} t0 7.8357e-06 log_rms 0.0196 cond 4.9\n  CI {'pipeline_overlap': (0.56, 0.656), 'hbm_efficiency': (0.704, 0.725), 'sparse_speedup_at_50': (1.678, 1.737)}\n","stderr":""}
