@@ -1,0 +1,30 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/memory.py'; s=open(p).read()
+s=s.replace("def estimate_layer(layer: WorkloadLayer, cfg: SimConfig, freq_ghz: float) -> LayerPerf:",
+ 'def estimate_layer(layer: WorkloadLayer, cfg: SimConfig, freq_ghz: float, exact_cycles: bool = True) -> LayerPerf:\n    """``exact_cycles=False`` drops the ceil() on the reduction depth (< 1 cycle per tile): used only by the calibration fits,\n    whose objective must be smooth in ``sparse_speedup_at_50``."""')
+s=s.replace("    cycles = (tiles * math.ceil(K_eff / thr)","    k_cycles = math.ceil(K_eff / thr) if exact_cycles else K_eff / thr\n    cycles = (tiles * k_cycles")
+open(p,'w').write(s)
+p='uchu/calibration/fit_hardware.py'; s=open(p).read()
+s=s.replace("estimate_layer(L, c, m.freq_ghz).duration_s for L, m in zip(layers, meas)]) + p[3]","estimate_layer(L, c, m.freq_ghz, exact_cycles=False).duration_s for L, m in zip(layers, meas)]) + p[3]")
+s=s.replace('''                    # coarse finite-difference step: cycle counts are ceil()-quantised, so the default 1e-8 step sees a staircase
+                    r = least_squares(lambda v: resid_for(free_, v), np.clip(p0[idx_], lo[idx_] + 1e-9, hi[idx_] - 1e-9),
+                                      bounds=(lo[idx_], hi[idx_]), x_scale="jac", diff_step=1e-3)''','''                    r = least_squares(lambda v: resid_for(free_, v), np.clip(p0[idx_], lo[idx_] + 1e-9, hi[idx_] - 1e-9),
+                                      bounds=(lo[idx_], hi[idx_]), x_scale="jac")''')
+open(p,'w').write(s)
+EOF
+grep -n "exact_cycles" uchu/memory.py uchu/calibration/fit_hardware.py | head
+python3 - <<'EOF'
+import sys,math; sys.path.insert(0,'/home/squire/uchu_v3')
+import numpy as np
+from uchu import *
+from uchu.calibration.fit_hardware import *
+from uchu.calibration.synthetic import *
+truth=make_truth_config(); start=analyst_start_config(truth)
+for noise in (0.0,0.02):
+    f=fit_performance(gen_perf(truth,start,make_rng(5,"c"),log_noise=noise),start,make_rng(4,"f"))
+    print("noise",noise,{k:round(v,5) for k,v in f.params.items()},"t0 %.3e"%f.t_launch_s,"log_rms %.4f"%f.log_rms,"cond %.1f"%f.cond)
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"uchu/memory.py:83:def estimate_layer(layer: WorkloadLayer, cfg: SimConfig, freq_ghz: float, exact_cycles: bool = True) -> LayerPerf:\nuchu/memory.py:84:    \"\"\"``exact_cycles=False`` drops the ceil() on the reduction depth (< 1 cycle per tile): used only by the calibration fits,\nuchu/memory.py:98:    k_cycles = math.ceil(K_eff / thr) if exact_cycles else K_eff / thr\nuchu/calibration/fit_hardware.py:356:        return np.array([estimate_layer(L, c, m.freq_ghz, exact_cycles=False).duration_s for L, m in zip(layers, meas)]) + p[3]\nuchu/calibration/fit_hardware.py:379:        pred = np.array([estimate_layer(L, c, m.freq_ghz, exact_cycles=False).duration_s for L, m in zip(layers, meas)]) + p[3]\nnoise 0.0 {'pipeline_overlap': 0.58721, 'hbm_efficiency': 0.71321, 'sparse_speedup_at_50': 1.70072} t0 7.583e-06 log_rms 0.0179 cond 5.0\nnoise 0.02 {'pipeline_overlap': 0.5869, 'hbm_efficiency': 0.70432, 'sparse_speedup_at_50': 1.70844} t0 7.218e-06 log_rms 0.0337 cond 5.0\n","stderr":""}
