@@ -1,0 +1,360 @@
+cd /home/squire/wavebrain_project; cat > tests/test_retention.py << 'EOF'
+"""Tests for the retention experiment: lesions, delay stepping, cache, half-life, verdict, runner."""
+import json
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+import wavebrain.retention as rt
+from wavebrain.randshapes import rand_write_phase
+from wavebrain.randstudy import rand_arm_config
+from wavebrain.retention import (DECODED, DELAYS, LESIONS, apply_lesion, best_r2, build_retention_arrays, format_report,
+                                 get_retention_arrays, half_life, main, mod_features, retention_key, run_retention,
+                                 trial_snapshots, verdict, zero_fast_field)
+from wavebrain.statedecode import snapshot_trial
+
+CFG_F, CFG_R = rand_arm_config("FULL", 3, 24), rand_arm_config("RING_ONLY", 3, 24)
+
+
+# ------------------------------------------------------------------- lesions
+def test_lesions_zero_exactly_what_they_say():
+    sim, _ = rand_write_phase(CFG_F, 0)
+    assert np.abs(sim.u).max() > 0 and np.abs(sim.s).max() > 0 and np.abs(sim.H).max() > 0
+    h, t = sim.H.copy(), sim.t
+    fast = sim.clone(); apply_lesion(fast, "fast")
+    assert not fast.u.any() and not fast.u_prev.any() and not fast._f.any()                  # all time levels
+    assert np.abs(fast.s).max() > 0                                                            # the slow field survives
+    np.testing.assert_array_equal(fast.H, h); assert fast.t == t
+    both = sim.clone(); apply_lesion(both, "both")
+    assert not both.u.any() and not both.s.any() and not both._s.any()
+    np.testing.assert_array_equal(both.H, h)
+    assert np.abs(sim.u).max() > 0                                                             # the original is untouched
+    with pytest.raises(ValueError):
+        apply_lesion(sim, "everything")
+    zero_fast_field(sim); assert not sim._f.any()
+
+
+# ----------------------------------------------------------- delay stepping
+@pytest.fixture(scope="module")
+def snaps():
+    return trial_snapshots(CFG_F, CFG_R, 0, delays=(0, 100, 200))
+
+
+def test_hologram_state_decays_exactly_and_is_independent_of_the_fields(snaps):
+    out, clips = snaps
+    decay = CFG_F.base.medium.holo_decay
+    H = out["HOLO"]["H"]
+    np.testing.assert_allclose(H[1], H[0] * decay ** 100, rtol=1e-4, atol=1e-9)
+    np.testing.assert_allclose(H[2], H[0] * decay ** 200, rtol=1e-4, atol=1e-9)
+    assert np.abs(H[0]).max() > 0.01 and clips == 0
+    for d in range(3):
+        np.testing.assert_array_equal(out["HOLO_SLOW"]["H"][d], H[d])                         # same hologram, different fields
+
+
+def test_each_lesion_leaves_only_its_own_state(snaps):
+    out, _ = snaps
+    assert not out["HOLO"]["s"].any()                                                          # fields zeroed: nothing drives s
+    assert not out["SLOW"]["H"].any()                                                          # hologram off: H is exactly 0
+    for lesion in ("HOLO_SLOW", "SLOW"):
+        assert np.abs(out[lesion]["s"][0]).max() > 0 and not np.allclose(out[lesion]["s"][0], out[lesion]["s"][2])
+    assert not np.allclose(out["SLOW"]["s"][0], out["HOLO_SLOW"]["s"][0])                      # the hologram changes the write dynamics
+    assert set(out) == set(LESIONS) and all(v["H"].shape == (3, 361) for v in out.values())
+
+
+def test_incremental_delay_stepping_equals_a_single_run_and_is_deterministic(snaps):
+    out, _ = snaps
+    direct, _ = trial_snapshots(CFG_F, CFG_R, 0, delays=(0, 200))
+    for lesion in LESIONS:
+        np.testing.assert_array_equal(direct[lesion]["s"][1], out[lesion]["s"][2])
+        np.testing.assert_array_equal(direct[lesion]["H"][1], out[lesion]["H"][2])
+    again, _ = trial_snapshots(CFG_F, CFG_R, 0, delays=(0, 100, 200))
+    np.testing.assert_array_equal(again["SLOW"]["s"], out["SLOW"]["s"])
+
+
+def test_hologram_state_at_250_steps_matches_the_v11_state_capture():
+    out, _ = trial_snapshots(CFG_F, CFG_R, 0, delays=(0, 250))
+    v11, _ = snapshot_trial(CFG_F, 0)
+    np.testing.assert_allclose(out["HOLO"]["H"][1], v11["H"], rtol=1e-6, atol=1e-9)              # lesion-independent
+    assert not np.allclose(out["HOLO_SLOW"]["s"][1], v11["s"])                                  # zeroing the fast field changes s
+
+
+# ----------------------------------------------------------------- cache
+def test_cache_roundtrip_stale_rejection_and_key_sensitivity(tmp_path, monkeypatch):
+    calls = []
+
+    def fake(cfg_full, cfg_ring, delays=DELAYS, verbose=False):
+        calls.append(tuple(delays))
+        n, D = cfg_full.n_trials, len(delays)
+        rng = np.random.default_rng(len(calls))
+        arr = {"clip_events": 0.0, "delays": np.array(delays)}
+        for name in LESIONS:
+            arr[f"H_{name}"] = rng.normal(size=(n, D, 361)); arr[f"s_{name}"] = rng.normal(size=(n, D, 361))
+        return arr
+
+    monkeypatch.setattr(rt, "build_retention_arrays", fake)
+    a1, c1 = get_retention_arrays(0, 24, (0, 100), tmp_path)
+    a2, c2 = get_retention_arrays(0, 24, (0, 100), tmp_path)
+    assert (c1, c2) == (False, True) and calls == [(0, 100)]
+    np.testing.assert_array_equal(a1["H_HOLO"], a2["H_HOLO"]); assert a2["clip_events"] == 0.0
+    _, c3 = get_retention_arrays(0, 24, (0, 200), tmp_path)                                   # other delays -> stale -> rebuilt
+    assert c3 is False and len(calls) == 2
+    assert retention_key(CFG_F, (0, 100)) != retention_key(CFG_F, (0, 200)) != retention_key(rand_arm_config("FULL", 4, 24), (0, 200))
+
+
+def test_mod_features_use_the_medium_coefficients():
+    rng = np.random.default_rng(0)
+    arr = {"H_HOLO": rng.normal(size=(5, 2, 361)), "s_HOLO": rng.normal(size=(5, 2, 361))}
+    med = CFG_F.base.medium
+    np.testing.assert_allclose(mod_features(arr, "HOLO", 1, med), 0.3 * arr["s_HOLO"][:, 1] + 0.5 * arr["H_HOLO"][:, 1])
+    m2 = replace(med, slow_mod=0.1, holo_mod=0.2)
+    np.testing.assert_allclose(mod_features(arr, "HOLO", 0, m2), 0.1 * arr["s_HOLO"][:, 0] + 0.2 * arr["H_HOLO"][:, 0])
+
+
+# ------------------------------------------------------- half-life and verdict
+D5 = (0, 250, 500, 1000, 2000)
+
+
+def _cell(r2, lo=0.05):
+    return {"r2": r2, "r2_lo": r2 - 0.05, "r2_hi": r2 + 0.05, "diff_vs_null": {"diff": r2, "lo": lo, "hi": r2 + 0.1}}
+
+
+def _sres(h=(0.2, 0.2, 0.18, 0.15, 0.12), s=(0.5, 0.3, 0.15, 0.05, 0.0), lo=0.05, hs_lo=0.05, null=-0.01, pc=0.999,
+          mp=0.4, clip=0.0, drop=()):
+    cells = {}
+    for name, vals in (("HOLO", h), ("SLOW", s), ("HOLO_SLOW", s)):
+        cells[name] = {str(d): {m: {r: _cell(v, lo) for r in ("linear", "rbf")} for m in ("1.0", "4.0")} for d, v in zip(D5, vals)}
+    for d in drop:
+        cells.pop(d)
+    return {"cells": cells, "delays": list(D5), "clip_events": clip,
+            "null": {m: {r: {"r2": null} for r in ("linear", "rbf")} for m in ("1.0", "4.0")},
+            "hs": {str(d): {m: {r: {"point": 0.0, "lo": hs_lo, "hi": 0.2} for r in ("linear", "rbf")} for m in ("1.0", "4.0")} for d in D5},
+            "baselines": {"fft_concat": {"shape": {"linear": {"r2": pc}}}, "map": {"position": {"linear": {"r2": mp}}}}}
+
+
+def test_half_life_interpolates_and_flags_no_decay_or_no_signal():
+    s = _sres(s=(0.4, 0.3, 0.15, 0.05, 0.0))
+    assert half_life(s, "SLOW") == pytest.approx(250 + (0.3 - 0.2) / (0.3 - 0.15) * 250)       # between 250 and 500
+    assert half_life(_sres(h=(0.2, 0.2, 0.19, 0.18, 0.15)), "HOLO") == ">2000"                  # never halves
+    assert half_life(_sres(s=(0.05, 0.04, 0.03, 0.02, 0.0)), "SLOW") is None                    # nothing to halve
+
+
+def test_best_r2_counts_a_cell_only_if_its_interval_versus_null_is_above_zero():
+    assert best_r2(_sres(), "HOLO", 250, "1.0") == (0.2, "linear")
+    assert best_r2(_sres(lo=-0.01), "HOLO", 250, "1.0")[0] == 0.0
+
+
+def test_verdict_invalid_inconclusive_and_controls():
+    assert verdict(_sres(clip=2.0))["outcome"] == "INVALID_CLIPPED"
+    assert verdict(_sres(drop=("SLOW",)))["outcome"] == "INCONCLUSIVE"
+    assert verdict(_sres(pc=0.4))["outcome"] == "POSITIVE_CONTROL_FAILS"
+    leaky = _sres(); leaky["null"]["4.0"]["rbf"]["r2"] = 0.2                                   # a leak at ANY noise level counts
+    assert verdict(leaky)["outcome"] == "CONTROL_FAILS"
+    assert verdict(_sres(null=0.04))["outcome"] != "CONTROL_FAILS"
+    assert verdict(_sres(mp=0.1))["outcome"] == "STATE_CONTROL_FAILS"
+
+
+def test_verdict_hologram_floor_extends_memory_slow_persists_and_both_fade():
+    assert verdict(_sres(h=(0.08, 0.07, 0.05, 0.04, 0.02)))["outcome"] == "HOLO_NEVER_ABOVE_FLOOR"
+    ext = verdict(_sres())
+    assert ext["outcome"] == "PLASTICITY_EXTENDS_MEMORY" and set(ext["half_lives"]) == set(DECODED)
+    assert verdict(_sres(hs_lo=-0.01))["outcome"] != "PLASTICITY_EXTENDS_MEMORY"              # not distinguishable from the slow field
+    assert verdict(_sres(hs_lo=-0.01, s=(0.5, 0.4, 0.3, 0.2, 0.15)))["outcome"] == "SLOW_PERSISTS"
+    assert verdict(_sres(h=(0.2, 0.15, 0.1, 0.099, 0.05), s=(0.5, 0.2, 0.05, 0.02, 0.0)))["outcome"] == "BOTH_FADE"
+    assert verdict(_sres(h=(0.2, 0.2, 0.2, 0.2, 0.101)))["outcome"] == "PLASTICITY_EXTENDS_MEMORY"   # threshold at the longest delay
+    assert verdict(_sres(h=(0.2, 0.2, 0.2, 0.2, 0.099), s=(0.5, 0.3, 0.2, 0.2, 0.0)))["outcome"] == "BOTH_FADE"
+
+
+def test_verdict_counts_the_hologram_only_with_a_positive_interval_and_can_use_another_noise_level():
+    assert verdict(_sres(lo=-0.01))["outcome"] == "HOLO_NEVER_ABOVE_FLOOR"
+    s = _sres()
+    for d in D5:
+        s["cells"]["HOLO"][str(d)]["4.0"] = {r: _cell(0.02) for r in ("linear", "rbf")}
+    assert verdict(s, "1.0")["outcome"] == "PLASTICITY_EXTENDS_MEMORY" and verdict(s, "4.0")["outcome"] == "HOLO_NEVER_ABOVE_FLOOR"
+
+
+# ---------------------------------------------------------------- end to end
+@pytest.fixture(scope="module")
+def tiny(tmp_path_factory):
+    cache = tmp_path_factory.mktemp("rcache")
+    kw = dict(n_trials=24, seeds=(3,), delays=(0, 100), cache_dir=cache, n_boot=50, k=4, repeats=2, verbose=False)
+    return run_retention(**kw), kw, cache
+
+
+def test_run_retention_structure_null_and_levels(tiny):
+    res, kw, cache = tiny
+    s = res["seeds"][3]
+    assert set(s["cells"]) == set(DECODED) and set(s["cells"]["HOLO"]) == {"0", "100"} and set(s["hs"]) == {"0", "100"}
+    for m in ("1.0", "4.0"):
+        for r in ("linear", "rbf"):
+            assert s["null"][m][r]["r2"] < 0.2
+    assert set(s["verdict_at"]) == {"1.0", "4.0"} and res["combined"]["outcome"] == s["verdict"]["outcome"]
+    again = run_retention(**kw)
+    assert again["seeds"][3]["cells"]["SLOW"]["0"]["1.0"]["rbf"]["r2"] == s["cells"]["SLOW"]["0"]["1.0"]["rbf"]["r2"]
+
+
+def test_comparison_levels(tiny, monkeypatch):
+    res, kw, cache = tiny
+    seen = []
+    real = rt.bootstrap_r2
+
+    def spy(E_a, Y, E_b=None, n_boot=2000, seed=0, level=0.95):
+        seen.append((E_b is not None, round(level, 6)))
+        return real(E_a, Y, E_b, n_boot, seed, level)
+
+    monkeypatch.setattr(rt, "bootstrap_r2", spy)
+    run_retention(**kw)
+    paired = {lv for p, lv in seen if p}
+    assert paired == {round(1 - 0.05 / 6, 6), round(1 - 0.05 / 2, 6)}                           # vs NULL (3 lesions x 2 readouts), vs SLOW (2 readouts)
+
+
+def test_noise_free_run_and_the_mults_option(tiny, tmp_path):
+    res, kw, cache = tiny
+    nf = run_retention(**{**kw, "mults": (0.0,)})
+    s = nf["seeds"][3]
+    assert set(s["verdict_at"]) == {"0.0"} and s["verdict"]["outcome"] in {                      # primary falls back to 0.0
+        "HOLO_NEVER_ABOVE_FLOOR", "PLASTICITY_EXTENDS_MEMORY", "SLOW_PERSISTS", "BOTH_FADE",
+        "STATE_CONTROL_FAILS", "POSITIVE_CONTROL_FAILS", "CONTROL_FAILS"}                       # 24 trials may fail a control
+    assert set(s["cells"]["HOLO"]["0"]) == {"0.0"} and all(v["r2"] < 0.2 for v in s["null"]["0.0"].values())
+    out = tmp_path / "nf.json"
+    assert main(["--trials", "24", "--seeds", "3", "--delays", "0,100", "--mults", "0.0", "--cache", str(cache),
+                 "--boot", "50", "--json", str(out)]) == 0
+    assert json.loads(out.read_text())["config"]["mults"] == [0.0]
+
+
+def test_report_and_cli(tiny, tmp_path):
+    res, kw, cache = tiny
+    text = format_report(res)
+    for needle in ("VERDICT (seed 3", "HOLO minus SLOW", "NULL (noise only)", "controls:", "COMBINED", "HOLO_SLOW 100"):
+        assert needle in text
+    out = tmp_path / "r.json"
+    assert main(["--trials", "24", "--seeds", "3", "--delays", "0,100", "--cache", str(cache), "--boot", "50", "--json", str(out)]) == 0
+    assert "3" in json.loads(out.read_text())["seeds"] and "_correct" not in out.read_text()
+EOF
+python3 - << 'EOF'
+def sub(s, old, new):
+    assert old in s, f"missing: {old[:70]}"
+    return s.replace(old, new, 1)
+p='mutation_check.py'; s=open(p).read()
+entries='''
+
+RETENTION_MUTATIONS = [
+    ("fast-field lesion zeroes only one time level",
+     "wavebrain/retention.py",
+     "    sim._f[...] = 0.0", "    sim._f[0] = 0.0",
+     "tests/test_retention.py", "lesions_zero_exactly"),
+    ("'fast' lesion also zeroes the slow field",
+     "wavebrain/retention.py",
+     '    elif what == "fast":\\n        zero_fast_field(sim)', '    elif what == "fast":\\n        clear_fields(sim)',
+     "tests/test_retention.py", "lesions_zero_exactly or leaves_only"),
+    ("'both' lesion leaves the slow field",
+     "wavebrain/retention.py",
+     '    if what == "both":\\n        clear_fields(sim)', '    if what == "both":\\n        zero_fast_field(sim)',
+     "tests/test_retention.py", "lesions_zero_exactly or leaves_only"),
+    ("SLOW lesion written with the hologram on",
+     "wavebrain/retention.py",
+     '"SLOW": ("RING_ONLY", "fast")', '"SLOW": ("FULL", "fast")',
+     "tests/test_retention.py", "leaves_only"),
+    ("delay stepping runs the cumulative delay each time",
+     "wavebrain/retention.py",
+     "            sim.run(d - t)", "            sim.run(d)",
+     "tests/test_retention.py", "incremental_delay"),
+    ("modulation coefficients swapped",
+     "wavebrain/retention.py",
+     "return medium.slow_mod * arrays[f\\"s_{lesion}\\"][:, j] + medium.holo_mod * arrays[f\\"H_{lesion}\\"][:, j]",
+     "return medium.holo_mod * arrays[f\\"s_{lesion}\\"][:, j] + medium.slow_mod * arrays[f\\"H_{lesion}\\"][:, j]",
+     "tests/test_retention.py", "mod_features"),
+    ("cache key ignores the delays",
+     "wavebrain/retention.py",
+     '+ f"|retention|{tuple(delays)}")', '+ "|retention|")',
+     "tests/test_retention.py", "cache_roundtrip"),
+    ("half-life not interpolated",
+     "wavebrain/retention.py",
+     "return float(d1 + (v1 - half) / (v1 - v2) * (d2 - d1))", "return float(d2)",
+     "tests/test_retention.py", "half_life"),
+    ("interval ignored when counting an R-squared",
+     "wavebrain/retention.py",
+     'return (c["r2"] if c["diff_vs_null"]["lo"] > 0 else 0.0), r', 'return (c["r2"] if c["diff_vs_null"]["hi"] > 0 else 0.0), r',
+     "tests/test_retention.py", "best_r2 or interval_and_can_use"),
+    ("NULL leak rule disabled",
+     "wavebrain/retention.py",
+     "    if leaks:\\n", "    if False:\\n",
+     "tests/test_retention.py", "invalid_inconclusive"),
+    ("hologram-beats-slow test uses the wrong side of the interval",
+     "wavebrain/retention.py",
+     'beats = sres["hs"][str(T)][mult][r]["lo"] > 0', 'beats = sres["hs"][str(T)][mult][r]["hi"] > 0',
+     "tests/test_retention.py", "floor_extends"),
+    ("extension needs no minimum R-squared",
+     "wavebrain/retention.py",
+     "    if h[T] >= MIN_R2 and beats:", "    if beats:",
+     "tests/test_retention.py", "floor_extends"),
+    ("hologram floor rule disabled",
+     "wavebrain/retention.py",
+     "    if max(h.values()) < MIN_R2:", "    if False:",
+     "tests/test_retention.py", "floor_extends"),
+    ("comparison family level dropped",
+     "wavebrain/retention.py",
+     "level_null = 1.0 - 0.05 / (len(DECODED) * len(readouts))", "level_null = 0.95",
+     "tests/test_retention.py", "comparison_levels"),
+]
+'''
+s=sub(s,"\n\ndef run_group(entries) -> int:", entries+"\n\ndef run_group(entries) -> int:")
+s=s.replace('"state", "modmap", "all"]','"state", "modmap", "retention", "all"]')
+s=sub(s,'''    if a.group in ("modmap", "all"):
+        print("== modulation-map defects ==")
+        missed += run_group(MODMAP_MUTATIONS)''','''    if a.group in ("modmap", "all"):
+        print("== modulation-map defects ==")
+        missed += run_group(MODMAP_MUTATIONS)
+    if a.group in ("retention", "all"):
+        print("== retention defects ==")
+        missed += run_group(RETENTION_MUTATIONS)''')
+s=sub(s,'''            r = subprocess.run(cmd, cwd=dst, capture_output=True, text=True)
+            killed = r.returncode != 0''','''            r = subprocess.run(cmd, cwd=dst, capture_output=True, text=True)
+            if r.returncode == 5:                      # pytest: "no tests collected" -- NOT a detection
+                print(f"ERROR   no tests selected for: {name}", flush=True)
+                continue
+            killed = r.returncode != 0''')
+s=sub(s,'''def main() -> int:
+    ap = argparse.ArgumentParser()''','''def audit() -> int:
+    """Every mutation entry must select at least one test (pytest exits with 5 when none is selected, which a
+    naive harness would count as 'caught')."""
+    import re
+    groups = {"v6": MUTATIONS, "pilot": PILOT_MUTATIONS, "readout": READOUT_MUTATIONS, "rand": RAND_MUTATIONS,
+              "decode": DECODE_MUTATIONS, "noise": NOISE_MUTATIONS, "state": STATE_MUTATIONS,
+              "modmap": MODMAP_MUTATIONS, "retention": RETENTION_MUTATIONS}
+    bad, total = [], 0
+    for g, entries in groups.items():
+        for name, rel, old, new, tests, *rest in entries:
+            total += 1
+            cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q", *tests.split()]
+            if rest and rest[0]:
+                cmd += ["-k", rest[0]]
+            r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+            n = sum(int(x) for x in re.findall(r": (\\d+)\\s*$", r.stdout, re.M)) or len(re.findall(r"::", r.stdout))
+            if r.returncode != 0 or n == 0:
+                bad.append((g, name, rest[0] if rest else None))
+    print(f"audited {total} mutation entries across {len(groups)} groups")
+    print("entries with an EMPTY test selection:", bad if bad else "none")
+    return 1 if bad else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--audit", action="store_true", help="check that every mutation entry selects at least one test")''')
+s=sub(s,'''    a = ap.parse_args()
+    missed = 0''','''    a = ap.parse_args()
+    if a.audit:
+        return audit()
+    missed = 0''')
+s=s.replace("[--group v6|pilot|readout|rand|decode|noise|state|modmap|all]","[--group v6|pilot|readout|rand|decode|noise|state|modmap|retention|all] [--audit]")
+open(p,'w').write(s)
+EOF
+python3 -c "import ast;ast.parse(open('mutation_check.py').read());import mutation_check as m;print('mutation_check ok; retention entries:', len(m.RETENTION_MUTATIONS))"
+python3 -m pytest tests/test_retention.py 2>&1 | tail -3
+md5sum wavebrain/*.py > /tmp/code_at_retention_final.txt
+setsid nohup python3 -m wavebrain.retention --trials 240 --seeds 0,1 --cache /home/squire/cache_ret_final --boot 2000 --json retention_results.json > retention_output.txt 2>&1 < /dev/null &
+sleep 150; tail -2 /home/squire/wavebrain_project/retention_output.txt | cut -c1-100
+
+Response:
+
+{"returncode":0,"stdout":"mutation_check ok; retention entries: 14\n................                                                         [100%]\n16 passed in 8.81s\n    trial 80/240 (94s)\n    trial 120/240 (140s)\n","stderr":""}
