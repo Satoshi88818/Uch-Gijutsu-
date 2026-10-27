@@ -1,0 +1,30 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import sys,time; sys.path.insert(0,'/home/squire/uchu_v3')
+import numpy as np
+from uchu import *
+from uchu.calibration import *
+from uchu.calibration.synthetic import *
+from uchu.calibration.data import AvfRequest, DesignFact
+rng=make_rng(11,"e2e")
+truth=make_truth_config(); start=analyst_start_config(truth)
+ion_x=[1.5,2.2,3.3,5.0,7.5,11.0,17.0,26.0,40.0,60.0,85.0]; pro_x=[12.,18.,25.,35.,50.,70.,100.,150.,200.]
+d=CalibrationData(env_tables=truth.radiation.tables, env_source="synthetic CREME tables")
+d.beam=[gen_beam(truth.radiation.sram.ion,"sram","ion","sram_ion",rng,1e8,ion_x),
+        gen_beam(truth.radiation.sram.proton,"sram","proton","sram_proton",rng,1e8,pro_x),
+        gen_beam(truth.radiation.register.ion,"register","ion","reg_ion",rng,1.2e7,ion_x)]
+d.mbu=gen_mbu(truth,600,rng); d.sep=gen_sep_catalog(truth,25.0,rng)
+d.power=gen_power(truth,rng); d.thermal=gen_thermal(truth,rng); d.perf=gen_perf(truth,start,rng)
+d.flight=[gen_flight(truth,"sram",5.4e8,2.0,rng)]
+d.avf=[AvfRequest("avf_sram","int8",1e-2,40)]
+d.design_facts=[DesignFact("radiation.gates_per_pe",1800,"synthetic netlist")]
+print("flight events:",d.flight[0].events,"| SEP events:",len(d.sep.durations_s))
+t=time.time(); rep=run_calibration(start,d,CalibrationOptions(seed=7,n_boot=80,n_draws=80)); print("calibration took %.1fs"%(time.time()-t))
+for s in rep.steps: print(f"  [{s.status:7s}] {s.name}", ("-- "+s.error) if s.error else "")
+print(rep.audit.render()[:400])
+import json
+print(json.dumps(rep.rate_summary,indent=1,default=float))
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"flight events: 125 | SEP events: 97\ncalibration took 7.6s\n  [ok     ] design facts \n  [ok     ] environment tables \n  [ok     ] beam: sram/ion (sram_ion) \n  [ok     ] beam: sram/proton (sram_proton) \n  [ok     ] beam: register/ion (reg_ion) \n  [ok     ] MBU multiplicity \n  [ok     ] SEP statistics \n  [ok     ] power model \n  [ok     ] thermal model \n  [ok     ] performance \n  [ok     ] AVF (avf_sram, int8, tol=0.01) \n  [ok     ] epistemic draws \n  [ok     ] flight-data update \n37/60 parameters calibrated or declared, 0 accepted placeholders, 23 UNRESOLVED\n  UNRESOLVED  radiation.register.proton.sigma_sat_cm2\n  UNRESOLVED  radiation.register.proton.x_th\n  UNRESOLVED  radiation.register.proton.width\n  UNRESOLVED  radiation.register.proton.shape\n  UNRESOLVED  radiation.logic_set.ion.sigma_sat_cm2\n  UNRESOLVED  radiation.logic_set.ion.x_th\n  UNRESOLVED  radiation.logic_set.\n{\n \"register\": {\n  \"placeholder\": 2.685198756513714e-10,\n  \"median\": 2.6874811458304313e-10,\n  \"lo\": 2.686817482871678e-10,\n  \"hi\": 2.689454874240303e-10,\n  \"posterior\": {\n   \"median\": 2.687354189632286e-10,\n   \"lo\": 2.686817482871678e-10,\n   \"hi\": 2.689454874240303e-10\n  }\n },\n \"sram\": {\n  \"placeholder\": 2.684948717015723e-10,\n  \"median\": 2.899802659602409e-10,\n  \"lo\": 2.456321151505383e-10,\n  \"hi\": 3.5599614125423973e-10,\n  \"posterior\": {\n   \"median\": 3.0954870413586303e-10,\n   \"lo\": 2.74323830560016e-10,\n   \"hi\": 3.560039820070251e-10\n  }\n }\n}\n","stderr":""}
