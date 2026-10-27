@@ -1,0 +1,439 @@
+cd /home/squire/uchu_v3 && cat > uchu/calibration/workflow.py <<'EOF'
+"""Calibration workflow orchestrator.
+
+    data  --->  [design facts] -> [environment tables] -> [beam: cross-sections] -> [MBU] -> [SEP] -> [power]
+                -> [thermal] -> [performance] -> [AVF] -> [joint epistemic draws + flight reweighting] -> [audit]
+
+Design rules
+  * every step is isolated: bad or insufficient data in one step records a FAILED step and leaves those parameters
+    UNRESOLVED; it never aborts the others and never silently substitutes a guess
+  * every fitted parameter is written to ``cfg.calibration`` (source, method, value, 95 % interval, notes)
+  * epistemic uncertainty is carried as joint parameter draws that can be pushed through the simulator
+    (``sample_configs`` / ``epistemic_mission_study``) -- not left as a table of intervals
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..config import CrossSection, SimConfig
+from ..orbit import FlareSchedule, OrbitalEnvironment
+from ..provenance import provenance
+from ..radiation import RadiationEnvironment
+from ..rng import child_seed, make_rng
+from . import data as D
+from .data import CalibrationData, CalibrationDataError
+from .fit_hardware import (apply_perf_fit, apply_power_fit, apply_thermal_fit, fit_performance, fit_power_model,
+                           fit_thermal_model, thermal_to_config_values)
+from .fit_radiation import (apply_cross_section_fit, apply_mbu_fit, apply_sep_fit, calibrate_avf, expected_events_for_flight,
+                            fit_cross_section, fit_mbu, fit_sep_statistics, flight_update, install_environment_tables,
+                            weighted_quantile)
+from .registry import AuditResult, declare, placeholder_audit, set_by_path
+
+
+@dataclass
+class CalibrationOptions:
+    seed: int = 0
+    n_boot: int = 200
+    n_draws: int = 200
+    flight_discrepancy_log_sigma: float = 0.0
+    min_perf_informative: int = 3
+
+
+@dataclass
+class StepResult:
+    name: str
+    status: str                          # ok | skipped | failed
+    summary: dict = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+def _f(x):
+    return float(x) if isinstance(x, (int, float, np.floating, np.integer)) else x
+
+
+def _ci(c):
+    return [float(c[0]), float(c[1])]
+
+
+# ---------------------------------------------------------------------------
+@dataclass
+class CalibrationReport:
+    config: SimConfig
+    initial_hash: str
+    steps: List[StepResult]
+    audit: AuditResult
+    options: CalibrationOptions
+    fits: Dict[str, object]
+    draws: List[Dict[str, object]]
+    weights: np.ndarray
+    flight: list
+    rate_summary: dict
+    provenance: dict
+
+    # ---- epistemic propagation ------------------------------------------------
+    def config_for_draw(self, j: int) -> SimConfig:
+        c = self.config.copy()
+        for path, val in self.draws[j].items():
+            set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+        return c.validate()
+
+    def sample_configs(self, n: int, rng: np.random.Generator) -> List[SimConfig]:
+        """Configs drawn from the (flight-reweighted) epistemic posterior over all fitted parameters."""
+        idx = rng.choice(len(self.draws), size=n, p=self.weights / self.weights.sum())
+        return [self.config_for_draw(int(j)) for j in idx]
+
+    # ---- serialisation -------------------------------------------------------
+    def to_dict(self) -> dict:
+        return {
+            "provenance": self.provenance, "initial_config_hash": self.initial_hash,
+            "calibrated_config_hash": self.config.config_hash(),
+            "options": vars(self.options),
+            "steps": [vars(s) for s in self.steps],
+            "ledger": self.config.calibration,
+            "audit": {"resolved": sorted(self.audit.resolved), "accepted": sorted(self.audit.accepted),
+                      "unresolved": self.audit.unresolved},
+            "flight": [{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in vars(fu).items() if k != "weights"}
+                       for fu in self.flight],
+            "rate_summary": self.rate_summary,
+        }
+
+    def to_markdown(self) -> str:
+        a = self.audit
+        L = ["# Calibration report", "",
+             f"*model {self.provenance['model_version']} · seed {self.options.seed} · "
+             f"config `{self.initial_hash}` → `{self.config.config_hash()}`*", "",
+             f"**{len(a.resolved)}/{a.n_total} required parameters calibrated or declared · "
+             f"{len(a.accepted)} accepted placeholders · {len(a.unresolved)} UNRESOLVED**", "", "## Steps", "",
+             "| step | status | notes |", "|---|---|---|"]
+        for s in self.steps:
+            note = (s.error or "; ".join(s.warnings[:2]) or "")[:140].replace("|", "/")
+            L.append(f"| {s.name} | {s.status} | {note} |")
+        L += ["", "## Calibrated parameters", "", "| parameter | value | 95 % interval | status | source · method |", "|---|---|---|---|---|"]
+        for p, e in sorted(self.config.calibration.items()):
+            v = e["value"]
+            vs = f"{v:.4g}" if isinstance(v, (int, float)) else str(v)
+            ci = "" if not e["ci95"] else f"[{e['ci95'][0]:.4g}, {e['ci95'][1]:.4g}]"
+            L.append(f"| `{p}` | {vs} | {ci} | {e['status']} | {e['source']} · {e['method']} |")
+        if self.rate_summary:
+            L += ["", "## Predicted per-bit upset rate (orbit-static, per bit per day)", "",
+                  "| region | placeholder | calibrated (95 %) | after flight data (95 %) |", "|---|---|---|---|"]
+            for r, d in self.rate_summary.items():
+                post = d.get("posterior")
+                L.append(f"| {r} | {d['placeholder']:.3g} | {d['median']:.3g} [{d['lo']:.3g}, {d['hi']:.3g}] | "
+                         + (f"{post['median']:.3g} [{post['lo']:.3g}, {post['hi']:.3g}]" if post else "n/a") + " |")
+        if self.flight:
+            L += ["", "## Flight-data consistency", "", "| log | observed | prior-expected | p(consistent) | posterior multiplier | ESS |", "|---|---|---|---|---|---|"]
+            for f in self.flight:
+                L.append(f"| {f.log} | {f.observed} | {f.expected_prior_mean:.1f} | {f.p_consistency:.3g} | "
+                         f"{f.posterior_multiplier_median:.2f} [{f.posterior_multiplier_ci95[0]:.2f}, {f.posterior_multiplier_ci95[1]:.2f}] | {f.ess:.0f} |")
+        warns = [(s.name, w) for s in self.steps for w in s.warnings]
+        if warns:
+            L += ["", "## Warnings", ""] + [f"- **{n}**: {w}" for n, w in warns]
+        if a.unresolved or a.accepted:
+            L += ["", "## Still placeholders", ""] + [f"- UNRESOLVED `{p}`" for p in a.unresolved] + \
+                 [f"- accepted `{p}` — {e['note']}" for p, e in a.accepted.items()]
+        return "\n".join(L) + "\n"
+
+    def save(self, out_dir) -> Path:
+        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+        (out / "calibrated_config.json").write_text(self.config.to_json())
+        (out / "calibration_report.json").write_text(json.dumps(self.to_dict(), indent=2, default=str))
+        (out / "calibration_report.md").write_text(self.to_markdown())
+        return out
+
+
+# ---------------------------------------------------------------------------
+def _static_rate_per_bit_day(cfg: SimConfig, region: str) -> float:
+    orbit = OrbitalEnvironment(cfg.orbital)
+    orbit.flares = FlareSchedule.from_events([])
+    return RadiationEnvironment(cfg, orbit).static_rate[region] * 86400.0
+
+
+def run_calibration(cfg: SimConfig, data: CalibrationData, opts: Optional[CalibrationOptions] = None) -> CalibrationReport:
+    opts = opts or CalibrationOptions()
+    initial_hash = cfg.config_hash()
+    placeholder_cfg = cfg.copy()
+    cfg = cfg.copy().validate()
+    steps: List[StepResult] = []
+    fits: Dict[str, object] = {}
+
+    def step(name: str, fn: Callable[[], Tuple[dict, List[str]]], active: bool = True):
+        if not active:
+            steps.append(StepResult(name, "skipped")); return
+        try:
+            summary, warns = fn()
+            steps.append(StepResult(name, "ok", summary, list(warns)))
+        except CalibrationDataError as e:
+            steps.append(StepResult(name, "failed", error=str(e)))
+        except Exception as e:                                           # a bug must not look like a data problem
+            steps.append(StepResult(name, "failed", error=f"INTERNAL {type(e).__name__}: {e}"))
+
+    rng = lambda *k: make_rng(opts.seed, "calib", *k)
+
+    # 1. declared design facts
+    def _facts():
+        for f in data.design_facts:
+            declare(cfg, f.path, f.value, f.source)
+        return {"declared": [f.path for f in data.design_facts]}, []
+    step("design facts", _facts, bool(data.design_facts))
+
+    # 2. environment
+    def _env():
+        w = install_environment_tables(cfg, data.env_tables, data.env_source or "environment tables")
+        return {"components": sorted(data.env_tables)}, w
+    step("environment tables", _env, bool(data.env_tables))
+
+    # 3. beam data
+    for ds in data.beam:
+        def _beam(ds=ds):
+            fit = fit_cross_section(ds, rng("xs", ds.name), n_boot=opts.n_boot)
+            apply_cross_section_fit(cfg, fit)
+            fits[f"xs:{ds.region}:{ds.kind}"] = fit
+            return ({"params": {k: _f(v) for k, v in fit.params.items()},
+                     "ci95": {k: _ci(c) for k, c in fit.ci95.items()}, "deviance_per_dof": _f(fit.dispersion),
+                     "p_value": _f(fit.p_value), "n_events": fit.n_events, "overdispersed": fit.overdispersed}, fit.warnings)
+        step(f"beam: {ds.region}/{ds.kind} ({ds.name})", _beam)
+
+    # 4. MBU
+    def _mbu():
+        fit = fit_mbu(data.mbu, rng("mbu")); apply_mbu_fit(cfg, fit); fits["mbu"] = fit
+        return {"p_mbu": fit.p_mbu, "p_mbu_ci95": _ci(fit.p_mbu_ci95), "geom_p": fit.geom_p,
+                "geom_p_ci95": _ci(fit.geom_p_ci95), "max_cluster": fit.max_cluster, "chi2_p": _f(fit.chi2_p_value)}, fit.warnings
+    step("MBU multiplicity", _mbu, data.mbu is not None)
+
+    # 5. SEP
+    def _sep():
+        fit = fit_sep_statistics(data.sep, rng("sep")); apply_sep_fit(cfg, fit); fits["sep"] = fit
+        return {"n_events": fit.n_events, "rate_per_year": fit.rate_per_year, "rate_ci95": _ci(fit.rate_ci95),
+                "median_intensity": fit.median_intensity, "log_sigma": fit.log_sigma}, fit.warnings
+    step("SEP statistics", _sep, data.sep is not None)
+
+    # 6-8. hardware
+    def _power():
+        fit = fit_power_model(data.power, cfg, rng("power")); apply_power_fit(cfg, fit, data.power_source); fits["power"] = fit
+        return {"values": fit.config_values, "ci95": {k: _ci(v) for k, v in fit.ci95.items()},
+                "rel_rms": fit.rel_rms_error, "cond": fit.cond}, fit.warnings
+    step("power model", _power, bool(data.power))
+
+    def _thermal():
+        fit = fit_thermal_model(data.thermal, cfg, rng("thermal")); apply_thermal_fit(cfg, fit, data.thermal_source); fits["thermal"] = fit
+        return {"values": fit.config_values, "ci95": {k: _ci(v) for k, v in fit.ci95.items()},
+                "rms_K": fit.rms_K, "cond": fit.cond, "fixed": fit.fixed}, fit.warnings
+    step("thermal model", _thermal, bool(data.thermal))
+
+    def _perf():
+        fit = fit_performance(data.perf, cfg, rng("perf"), min_informative=opts.min_perf_informative)
+        apply_perf_fit(cfg, fit, data.perf_source); fits["perf"] = fit
+        return {"params": fit.params, "ci95": {k: _ci(v) for k, v in fit.ci95.items()}, "t_launch_s": fit.t_launch_s,
+                "unresolved": fit.fixed, "informative": fit.informative, "log_rms": fit.log_rms}, fit.warnings
+    step("performance", _perf, bool(data.perf))
+
+    # 9. AVF
+    for req in data.avf:
+        def _avf(req=req):
+            r = calibrate_avf(cfg, req.field, req.dtype, req.tol, req.trials_per_bit, req.shape, seed=opts.seed)
+            return {"avf": r.avf, "ci95": [r.ci_low, r.ci_high], "used": getattr(cfg.radiation, req.field)}, []
+        step(f"AVF ({req.field}, {req.dtype}, tol={req.tol})", _avf)
+
+    # 10. joint epistemic draws, flight reweighting
+    draws: List[Dict[str, object]] = []
+    weights = np.ones(opts.n_draws)
+    flight_updates: list = []
+    rate_summary: dict = {}
+
+    def _draws():
+        nonlocal weights
+        r = rng("draws")
+        for _ in range(opts.n_draws):
+            a: Dict[str, object] = {}
+            for key, fit in fits.items():
+                if key.startswith("xs:"):
+                    _, region, kind = key.split(":")
+                    a[f"radiation.{region}.{kind}"] = fit.draw(int(r.integers(len(fit.samples))))
+                elif key == "mbu":
+                    i = int(r.integers(len(fit.p_samples)))
+                    a.update({"radiation.mbu_prob": float(fit.p_samples[i]), "radiation.mbu_cluster_geom_p": float(max(fit.q_samples[i], 1e-3))})
+                elif key == "sep":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    a.update({"orbital.sep_events_per_year": float(s[0]), "orbital.sep_mean_duration_s": float(s[1]),
+                              "orbital.sep_intensity_median": float(s[2]), "orbital.sep_intensity_log_sigma": float(s[3])})
+                elif key == "power":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    a.update({"power.base_power_w": float(s[0]), "power.static_frac": float(s[1]),
+                              "power.leak_temp_coeff": float(s[2]), "power.clock_frac": float(s[3])})
+                elif key == "thermal":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    vals, _ = thermal_to_config_values(cfg, *s)
+                    for k, v in vals.items():
+                        if not (k == "earth_view_fraction" and "Q_ecl" in fit.fixed) and not (k == "sun_projected_fraction" and "Q_sun" in fit.fixed):
+                            a[f"thermal.{k}"] = float(v)
+                elif key == "perf":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    for n, v in zip(("compute.pipeline_overlap", "memory.hbm_efficiency", "compute.sparse_speedup_at_50"), s):
+                        a[n] = float(v)
+            draws.append(a)
+        return {"n_draws": len(draws), "sources": sorted(fits)}, []
+    step("epistemic draws", _draws, bool(fits))
+
+    report_cfg = cfg   # best-estimate config
+
+    def _flight():
+        nonlocal weights
+        wts = np.ones(len(draws))
+        cfgs = []
+        for a in draws:
+            c = report_cfg.copy()
+            for path, val in a.items():
+                set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+            cfgs.append(c)
+        warns: List[str] = []
+        for log in data.flight:
+            E = np.array([expected_events_for_flight(c, log.region, log.n_units, log.segments, log.flare_events) for c in cfgs])
+            fu = flight_update(E, log.events, opts.flight_discrepancy_log_sigma, log=log.name)
+            flight_updates.append(fu); warns += [f"{log.name}: {w}" for w in fu.warnings]
+            wts = wts * fu.weights
+        weights = wts / wts.sum()
+        return {"logs": [f.log for f in flight_updates],
+                "combined_ess": float(1.0 / np.sum(weights ** 2))}, warns
+    step("flight-data update", _flight, bool(data.flight) and bool(draws))
+
+    # rate summary (SRAM, plus any region with a fitted ion cross-section)
+    if draws:
+        regions = sorted({k.split(":")[1] for k in fits if k.startswith("xs:")})
+        for region in regions:
+            vals = np.array([_static_rate_per_bit_day(
+                _apply(report_cfg, a), region) for a in draws])
+            lo, med, hi = weighted_quantile(vals, np.ones(len(vals)), [0.025, 0.5, 0.975])
+            d = {"placeholder": _static_rate_per_bit_day(_with_env(placeholder_cfg, cfg), region),
+                 "median": float(med), "lo": float(lo), "hi": float(hi)}
+            if flight_updates:
+                lo2, med2, hi2 = weighted_quantile(vals, weights, [0.025, 0.5, 0.975])
+                d["posterior"] = {"median": float(med2), "lo": float(lo2), "hi": float(hi2)}
+            rate_summary[region] = d
+
+    audit = placeholder_audit(cfg)
+    return CalibrationReport(cfg, initial_hash, steps, audit, opts, fits, draws, weights, flight_updates, rate_summary,
+                             provenance(cfg, opts.seed))
+
+
+def _apply(cfg: SimConfig, assign: Dict[str, object]) -> SimConfig:
+    c = cfg.copy()
+    for path, val in assign.items():
+        set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+    return c
+
+
+def _with_env(placeholder_cfg: SimConfig, calibrated: SimConfig) -> SimConfig:
+    """Placeholder cross-sections evaluated in the calibrated environment (isolates the effect of the beam data)."""
+    c = placeholder_cfg.copy()
+    c.radiation.environment_mode = calibrated.radiation.environment_mode
+    c.radiation.tables = {k: type(v)(list(v.x), list(v.phi_integral)) for k, v in calibrated.radiation.tables.items()}
+    return c
+
+
+# ---------------------------------------------------------------------------
+def epistemic_mission_study(report: CalibrationReport, layers, mission_s: float, n: int = 16, duty: float = 1.0,
+                            dt_max_s: float = 30.0, seed: int = 0) -> Dict[str, np.ndarray]:
+    """Push epistemic parameter draws through the simulator: spread of mission outputs due to calibration uncertainty."""
+    from ..simulator import run_mission
+    cfgs = report.sample_configs(n, make_rng(seed, "epistemic"))
+    out = {k: [] for k in ("T_max_k", "avg_tflops", "avg_power_w", "sdc_per_hr", "seu_sram")}
+    for i, c in enumerate(cfgs):
+        r = run_mission(c, layers, mission_s, duty, dt_max_s, seed=child_seed(seed, "epi", i))
+        out["T_max_k"].append(r.T_max_k); out["avg_tflops"].append(r.avg_tflops_dense)
+        out["avg_power_w"].append(r.avg_power_w); out["sdc_per_hr"].append(r.radiation.sdc_per_hr)
+        out["seu_sram"].append(r.radiation.n_seu_sram)
+    return {k: np.array(v) for k, v in out.items()}
+
+
+# ---------------------------------------------------------------------------
+# Plan files / CLI
+# ---------------------------------------------------------------------------
+def load_plan(path) -> Tuple[SimConfig, CalibrationData, CalibrationOptions]:
+    path = Path(path)
+    plan = json.loads(path.read_text())
+    base = path.parent
+    cfg = SimConfig.from_json((base / plan["base_config"]).read_text()) if plan.get("base_config") else SimConfig()
+    data = CalibrationData()
+    env = plan.get("environment")
+    if env:
+        data.env_tables = {k: D.load_spectrum_csv(base / f) for k, f in env["tables"].items()}
+        data.env_source = env.get("source", "environment tables")
+    for b in plan.get("beam", []):
+        data.beam.append(D.load_beam_csv(base / b["file"], b["region"], b["kind"], b.get("name")))
+    if "mbu" in plan:
+        data.mbu = D.load_mbu_csv(base / plan["mbu"]["file"])
+    if "sep" in plan:
+        data.sep = D.load_sep_csv(base / plan["sep"]["file"], plan["sep"]["obs_span_s"])
+    if "power" in plan:
+        data.power = D.load_power_csv(base / plan["power"]["file"]); data.power_source = plan["power"].get("source", "power measurements")
+    if "thermal" in plan:
+        data.thermal = D.load_thermal_csv(base / plan["thermal"]["file"]); data.thermal_source = plan["thermal"].get("source", "thermal telemetry")
+    if "perf" in plan:
+        data.perf = D.load_perf_csv(base / plan["perf"]["file"]); data.perf_source = plan["perf"].get("source", "performance microbenchmarks")
+    for f in plan.get("flight", []):
+        data.flight.append(D.FlightLog(f["name"], f["region"], f["n_units"], tuple(map(tuple, f["segments"])), int(f["events"]),
+                                       tuple(map(tuple, f.get("flare_events", [])))))
+    for a in plan.get("avf", []):
+        data.avf.append(D.AvfRequest(**{**a, "shape": tuple(a.get("shape", (32, 32, 32)))}))
+    for d in plan.get("design_facts", []):
+        data.design_facts.append(D.DesignFact(d["path"], d["value"], d["source"]))
+    return cfg, data, CalibrationOptions(**plan.get("options", {}))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m uchu.calibration", description="Run the Uchu Gijutsu calibration workflow.")
+    ap.add_argument("plan", help="calibration plan (JSON)")
+    ap.add_argument("--out", default="calibration_out", help="output directory")
+    args = ap.parse_args(argv)
+    t0 = time.time()
+    try:
+        cfg, data, opts = load_plan(args.plan)
+    except (CalibrationDataError, OSError, KeyError, ValueError) as e:
+        print(f"PLAN ERROR: {e}", file=sys.stderr)
+        return 3
+    rep = run_calibration(cfg, data, opts)
+    out = rep.save(args.out)
+    print(rep.audit.render())
+    for s in rep.steps:
+        print(f"  [{s.status:7s}] {s.name}" + (f"  -- {s.error}" if s.error else ""))
+    print(f"wrote {out}/ in {time.time() - t0:.1f}s")
+    return 2 if any(s.status == "failed" for s in rep.steps) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+cat > uchu/calibration/__main__.py <<'EOF'
+import sys
+from .workflow import main
+sys.exit(main())
+EOF
+cat > uchu/calibration/__init__.py <<'EOF'
+"""Calibration workflow for the placeholder parameters of Uchu Gijutsu v3."""
+from .data import (BeamDataset, BeamPoint, CalibrationData, CalibrationDataError, FlightLog, MbuDataset, PerfMeasurement,
+                   PowerMeasurement, SepCatalog, ThermalSample, effective_let, load_beam_csv, load_mbu_csv,
+                   load_perf_csv, load_power_csv, load_sep_csv, load_spectrum_csv, load_thermal_csv)
+from .fit_hardware import (design_coverage, fit_performance, fit_power_model, fit_thermal_model, suggest_gemm_shapes,
+                           suggest_power_design)
+from .fit_radiation import (calibrate_avf, fit_cross_section, fit_mbu, fit_power_law_to_table, fit_sep_statistics,
+                            flight_update, gamma_scale_posterior, install_environment_tables)
+from .registry import (UncalibratedError, accept_placeholder, declare, placeholder_audit, require_calibrated)
+from .workflow import (CalibrationOptions, CalibrationReport, epistemic_mission_study, load_plan, run_calibration)
+EOF
+python3 -c "
+import sys; sys.path.insert(0,'.')
+import uchu.calibration as c; print('import ok', len(dir(c)))"
+
+Response:
+
+{"returncode":0,"stdout":"import ok 56\n","stderr":""}
