@@ -1,0 +1,6843 @@
+# Uchū Gijutsu v3.1 — Calibration Workflow for the Placeholder Parameters
+
+This document **supersedes** `Uchu_Gijutsu_v3_validated.md`: the core files `config.py`, `memory.py`, `orbit.py` and `radiation.py` changed (calibration hooks), so the complete, current tree is embedded below, verbatim.
+
+## 0. Summary
+
+The v3 simulator had 60 parameters the physics depends on that were placeholders (cross-sections, spectra, orbit scalings, MBU/SEP statistics, power, thermal, performance). This release adds a workflow that **replaces placeholders with fitted, uncertainty-quantified values from measurements, tracks which ones are still guesses, and pushes the remaining uncertainty through the simulator.**
+
+| | |
+|---|---|
+| New code | `uchu/calibration/` — loaders, registry/audit, radiation fits, hardware fits, orchestrator + CLI, synthetic campaigns |
+| Tests | **237** (was 129), **98 %** line coverage, all passing |
+| Mutation check | **46/46** injected defects caught (15 original + 31 calibration) |
+| Validation | hidden-truth recovery on synthetic campaigns: **547/580 (94.3 %)** of 95 % intervals contain the truth over 20 independent campaigns |
+| Effect on outputs | SRAM upset-rate error **−68.5 % → −0.6 %**; mission power error **−25.7 % → −0.8 %**; mean temperature error **−21.3 K → −0.3 K** |
+
+> **Read this first.** Everything above is validated on **synthetic** measurements generated from a hidden truth *by the same model forms the workflow fits* (Weibull cross-sections, lumped thermal node, roofline). That proves the estimators, uncertainty quantification, identifiability guards and bookkeeping work. It does **not** prove those model forms describe your hardware. Real beam, bench and flight data will contain effects absent here (dosimetry error, SEL/SEFI contamination, temperature dependence, model-form error). The workflow detects some of these (over-dispersion, inconsistent flight counts, ill-conditioned designs) and says so; it cannot detect all of them. §7 lists what remains.
+
+## 1. How the workflow works
+
+```
+ measurements ─► validated loaders ─► per-family fits ─► joint epistemic draws ─► flight-data reweighting ─► calibrated config
+ (CSV/JSON)      (reject bad data      (MLE / NLS +        (one draw = one          (importance weights,        + report (md/json)
+                  with row/col msgs)    bootstrap / Wald)    plausible chip+env)      consistency p-value)        + provenance ledger
+                                              │                                                                      │
+                                              └──── every fitted value written to cfg.calibration ──► placeholder_audit() ◄┘
+```
+
+Design rules (each enforced by tests):
+1. **Steps are isolated.** Bad or insufficient data in one step records a `failed` step and leaves *those* parameters unresolved and unchanged; it never aborts other steps, never substitutes a guess. Internal exceptions are reported as `INTERNAL …`, never disguised as data problems.
+2. **Non-identifiable designs are refused, not fitted.** Condition numbers are judged on parameter-range-scaled Jacobians; a parameter with no sensitivity at the optimum is dropped and reported unresolved while the others still fit.
+3. **Provenance is a ledger, not a comment.** `cfg.calibration[path]` holds source, method, value, 95 % interval, status (`measured | derived | design_fact | absorbed | accepted_placeholder`) and notes; it is part of the config hash.
+4. **Uncertainty is propagated, not tabulated.** The report carries joint parameter draws; `sample_configs()` and `epistemic_mission_study()` run them through the simulator.
+5. **Intervals that rest on placeholders say so.** Each region's rate summary reports the fraction of its rate carried by cross-section families still unresolved (§4).
+
+### What resolves each placeholder
+
+| Placeholder family | Data required | Method | Uncertainty | Guards |
+|---|---|---|---|---|
+| Environment spectra, orbit scalings, shielding | orbit-specific integral-flux tables (CREME96 / OMERE / SPENVIS / AP-9) | installed directly (`environment_mode = "tabulated_orbit"`); **all** placeholder scalings bypassed | external tool's | table-coverage warning if a table starts above a cross-section threshold |
+| Cross-sections σ_sat, x_th, W, s (per region × ion/proton) | beam counts: LET or energy, fluence, events, units | Poisson maximum likelihood (Weibull), multi-start | parametric bootstrap (negative-binomial resample when over-dispersed) | deviance GOF p-value, dispersion, bound / saturation / degeneracy warnings; zero-event data → upper limit only |
+| MBU probability, cluster-size law, max cluster | strike multiplicity histogram | closed-form MLE (binomial + truncated geometric) | Wilson; Jeffreys draws | χ² GOF; truncation warning |
+| SEP rate, duration, intensity law | event catalogue + observation span | exponential / lognormal / Poisson MLE | Garwood, χ², t | <3 events refused, <10 warned |
+| `avf_sram` | none (computed) | real bit-flip injection into GEMMs | Wilson; **upper bound stored** (conservative) | — |
+| Power: base, static fraction, leak slope, clock share | bench sweep over T, f, V, util | nonlinear least squares, relative residuals | Wald → MVN draws | range-scaled condition number; at-bound warnings |
+| Thermal: C, radiator area, Earth/Sun loads | telemetry with eclipse flags and varying power | Newton/backward-Euler trajectory fit (verified equal to `LumpedThermalModel`) | Wald → MVN draws | refused if C not identifiable; missing eclipse/sunlit leaves that load unresolved |
+| Performance: `pipeline_overlap`, `hbm_efficiency`, `sparse_speedup_at_50` | GEMM latencies (+ launch overhead nuisance) | log-latency least squares | Wald → MVN draws | per-parameter regime counts; zero-sensitivity drop; `design_coverage()` *before* benchmarking |
+| On-orbit EDAC counts | counts, exposure windows, SEP catalogue | importance reweighting of the beam-derived draws; optional lognormal model-discrepancy | posterior over draws | prior-predictive consistency p-value, ESS |
+| **Not fittable from these data:** `avf_register/logic`, `gates_per_pe`, `reg_bits_per_pe`, `set_pulse_width_ps`, `tmr_residual`, `sel_recovery_s`, `interconnect_frac`, `interconnect_extra_exponent` | netlist / RTL fault injection / layout / ops decisions | `declare(cfg, path, value, source)` | — | stay **unresolved** in the audit until declared |
+
+## 2. Quick start
+
+```bash
+pip install numpy scipy pytest pytest-cov
+python tools/calibration_demo.py            # synthetic campaign -> CSV files -> plan.json -> CLI -> report
+python -m uchu.calibration plan.json --out out/     # exit 0 ok · 2 a step failed · 3 plan/file error
+```
+
+```python
+from uchu import SimConfig, build_transformer_workload
+from uchu.calibration import (load_plan, run_calibration, CalibrationOptions, placeholder_audit, require_calibrated,
+                              declare, epistemic_mission_study)
+
+cfg, data, opts = load_plan("plan.json")                  # or build CalibrationData in Python
+rep = run_calibration(cfg, data, CalibrationOptions(seed=1, n_boot=200, n_draws=200))
+rep.save("out/")                                          # calibrated_config.json, calibration_report.{json,md}
+print(rep.audit.render())                                 # what is STILL a guess
+
+declare(rep.config, "radiation.avf_register", 0.35, "RTL fault injection run 14")   # known facts get recorded, too
+require_calibrated(rep.config, ["radiation.sram.ion.sigma_sat_cm2", "radiation.sram.proton.sigma_sat_cm2"])   # gate a study
+
+study = epistemic_mission_study(rep, build_transformer_workload(num_layers=12), mission_s=86400, n=32)
+print(study["sdc_per_hr"], study["T_max_k"])              # spread of outputs caused by calibration uncertainty
+```
+
+`plan.json` (paths relative to the plan; see `write_campaign` in `synthetic.py` for a complete generated example):
+
+```json
+{"base_config": "start_config.json", "options": {"seed": 7, "n_boot": 200, "n_draws": 200},
+ "environment": {"source": "CREME96 run A, 550 km 51.6°, 2 mm Al", "tables": {"gcr_ion": "gcr.csv", "trapped_proton": "trapped.csv",
+                 "sep_ion": "sep_ion.csv", "sep_proton": "sep_p.csv"}},
+ "beam":  [{"file": "sram_ion.csv", "region": "sram", "kind": "ion"}, {"file": "sram_proton.csv", "region": "sram", "kind": "proton"}],
+ "mbu": {"file": "mbu.csv"}, "sep": {"file": "sep.csv", "obs_span_s": 788940000},
+ "power": {"file": "power.csv"}, "thermal": {"file": "thermal.csv"}, "perf": {"file": "perf.csv"},
+ "flight": [{"name": "unit A", "region": "sram", "n_units": 5.4e8, "segments": [[0, 3e7], [3.5e7, 6.3e7]], "events": 319,
+             "flare_events": [[1.2e7, 1.3e7, 0.8]]}],
+ "avf": [{"field": "avf_sram", "dtype": "int8", "tol": 0.01, "trials_per_bit": 100}],
+ "design_facts": [{"path": "radiation.gates_per_pe", "value": 1800, "source": "netlist rev C"}]}
+```
+
+CSV schemas (`#` comments and blank lines ignored; every error names file, row and column):
+
+| file | columns |
+|---|---|
+| beam, ion | `let_mev_cm2_mg, fluence_cm2, events` + optional `tilt_deg, n_units` — LET→LET/cosθ, fluence→F·cosθ (≤ 60°) |
+| beam, proton | `energy_mev, fluence_cm2, events` + optional `n_units` |
+| spectrum | `x, phi_integral` — Φ(>x) in particles/cm²/s, x ascending, Φ non-increasing |
+| mbu | `cluster_size, count` |
+| sep | `duration_s, intensity_rel` (relative to the reference event in the SEP tables) + `obs_span_s` in the plan |
+| power | `T_k, f_ghz, v_v, util, power_w` (junction temperature) |
+| thermal | `t_s, power_w, eclipse, T_k` — row *i* describes the interval **ending** at `t_s`; row 0 is the initial condition |
+| perf | `M, K, N, dtype, sparsity, freq_ghz, latency_s` |
+
+**Experiment design helpers** (run them *before* spending bench time): `suggest_power_design()` (18 points, condition ≈ 10²), `suggest_gemm_shapes(cfg)` and `design_coverage(cfg)` (how many shapes are informative per parameter **on your chip**: e.g. on the default 2 TB/s chip no GEMM is ever bandwidth-limited, so `hbm_efficiency` is unobservable and `design_coverage` says 0).
+
+## 3. Interpreting the output
+
+| message | meaning | what to do |
+|---|---|---|
+| `over-dispersed (deviance/dof = …)` | Poisson noise does not explain the scatter | check fluence/dosimetry, SEL/SEFI contamination; intervals were widened but the point estimate is suspect |
+| `estimate sits on a search bound for [...]` | parameter not determined by the data | rely on the *predicted rate* interval, not on that parameter (see §5) |
+| `saturation not reached …` | σ_sat is an extrapolation | add higher-LET points |
+| `⚠ N % rests on placeholder … cross-section` | that region's rate interval excludes the uncertainty of an unresolved cross-section | calibrate it, or treat the interval as meaningless |
+| `flight count … inconsistent with the beam-derived model` | prior-predictive p < 0.01 | environment/shielding/geometry wrong, or a mechanism absent from beam data; use `flight_discrepancy_log_sigma` only after investigating |
+| `ill-conditioned design` / `cannot identify` | measurements do not vary the parameters independently | add the measurements named in the message |
+| `zero sensitivity at the optimum` | that regime does not bind on this chip | parameter stays a placeholder (unresolved) |
+| `absorbed` (ledger) | confounded with another fitted parameter (e.g. ECC overhead into `hbm_efficiency`) | nothing; recorded so it is not mistaken for measured |
+
+## 4. Example output
+
+Generated by `tools/calibration_demo.py` (synthetic campaign, hidden truth; the CLI path end to end):
+
+```
+campaign files: ['beam_register_ion.csv', 'beam_sram_ion.csv', 'beam_sram_proton.csv', 'env_gcr_ion.csv', 'env_sep_ion.csv', 'env_sep_proton.csv', 'env_trapped_proton.csv', 'mbu.csv', 'perf.csv', 'plan.json', 'power.csv', 'sep.csv', 'start_config.json', 'thermal.csv']
+
+37/60 parameters calibrated or declared, 0 accepted placeholders, 23 UNRESOLVED
+  [ok     ] design facts
+  [ok     ] environment tables
+  [ok     ] beam: sram/ion (sram_ion)
+  [ok     ] beam: sram/proton (sram_proton)
+  [ok     ] beam: register/ion (register_ion)
+  [ok     ] MBU multiplicity
+  [ok     ] SEP statistics
+  [ok     ] power model
+  [ok     ] thermal model
+  [ok     ] performance
+  [ok     ] AVF (avf_sram, int8, tol=0.01)
+  [ok     ] epistemic draws
+  [ok     ] flight-data update
+wrote /tmp/caldemo/out/ in 5.0s
+
+hidden truth inside the 95 % interval: 25/29 parameters
+SRAM upset rate / bit / day: truth 8.534e-10 | shipped placeholder 2.685e-10 | calibrated 8.345e-10 [7.543e-10, 8.966e-10]
+outputs in /tmp/caldemo/out
+```
+
+Report excerpt (`calibration_report.md`, seed 11):
+
+```markdown
+# Calibration report
+
+*model 3.0.0 · seed 7 · config `a90ef53b95de4c5c` → `06e52762d741bfd9`*
+
+**37/60 required parameters calibrated or declared · 0 accepted placeholders · 23 UNRESOLVED**
+
+## Steps
+
+| step | status | notes |
+|---|---|---|
+| design facts | ok |  |
+| environment tables | ok |  |
+| beam: sram/ion (sram_ion) | ok |  |
+| beam: sram/proton (sram_proton) | ok |  |
+| beam: register/ion (reg_ion) | ok |  |
+| MBU multiplicity | ok | largest observed cluster (5) is the truncation point: the tail beyond it is unobserved |
+| SEP statistics | ok |  |
+| power model | ok | interconnect_frac is not identifiable from chip-level power (it only splits the active power); supply it from post-layout analysis via regis |
+| thermal model | ok |  |
+| performance | ok | hbm_efficiency absorbs the ECC bandwidth overhead (not separable from achieved-bandwidth efficiency) |
+| AVF (avf_sram, int8, tol=0.01) | ok |  |
+| epistemic draws | ok |  |
+| flight-data update | ok |  |
+
+## Calibrated parameters
+
+| parameter | value | 95 % interval | status | source · method |
+|---|---|---|---|---|
+| `compute.pipeline_overlap` | 0.6134 | [0.5628, 0.6687] | measured | performance microbenchmarks · log-latency least squares + Wald/MVN |
+| `compute.sparse_speedup_at_50` | 1.716 | [1.685, 1.748] | measured | performance microbenchmarks · log-latency least squares + Wald/MVN |
+| `memory.ecc_bw_overhead_pct` | 12.5 |  | absorbed | performance microbenchmarks · absorbed into hbm_efficiency |
+| `memory.hbm_efficiency` | 0.7235 | [0.7101, 0.7346] | measured | performance microbenchmarks · log-latency least squares + Wald/MVN |
+| `orbital.sep_events_per_year` | 4.68 | [3.87, 5.609] | measured | sep · Poisson MLE (Garwood) |
+| `orbital.sep_intensity_log_sigma` | 1.509 | [1.337, 1.732] | measured | sep · lognormal MLE |
+| `orbital.sep_intensity_median` | 0.9048 | [0.6863, 1.193] | measured | sep · lognormal MLE |
+| `orbital.sep_mean_duration_s` | 1.049e+05 | [8.822e+04, 1.268e+05] | measured | sep · exponential MLE |
+| `power.base_power_w` | 62.37 | [61.93, 62.9] | measured | power measurements · nonlinear least squares (relative residuals) + Wald/MVN |
+| `power.clock_frac` | 0.1223 | [0.09117, 0.1522] | measured | power measurements · nonlinear least squares (relative residuals) + Wald/MVN |
+| `power.leak_temp_coeff` | 3.132 | [3.023, 3.236] | measured | power measurements · nonlinear least squares (relative residuals) + Wald/MVN |
+| `power.static_frac` | 0.3835 | [0.3635, 0.4039] | measured | power measurements · nonlinear least squares (relative residuals) + Wald/MVN |
+| `radiation.avf_sram` | 0.4292 | [0.3237, 0.4292] | measured | GEMM bit-flip injection int8 (32, 32, 32) tol=0.01 · Monte-Carlo fault injection + Wilson |
+| `radiation.environment` | tabulated_orbit |  | measured | synthetic CREME tables · orbit-specific tabulated flux (CREME96/OMERE/AP-9) |
+| `radiation.gates_per_pe` | 1800 |  | design_fact | synthetic netlist · declared |
+| `radiation.mbu_cluster_geom_p` | 0.4186 | [0.3547, 0.4854] | measured | mbu · truncated-geometric MLE + Wilson |
+| `radiation.mbu_max_cluster` | 5 |  | derived | mbu · largest observed cluster |
+| `radiation.mbu_prob` | 0.1867 | [0.1575, 0.2198] | measured | mbu · binomial MLE + Wilson |
+| `radiation.register.ion.shape` | 1.393 | [0.9029, 2.082] | measured | reg_ion · Poisson MLE (Weibull) + parametric bootstrap |
+| `radiation.register.ion.sigma_sat_cm2` | 5.445e-14 | [4.774e-14, 6.09e-14] | measured | reg_ion · Poisson MLE (Weibull) + parametric bootstrap |
+```
+
+## 5. Validation
+
+### 5.1 Hidden-truth recovery (seed 11, `n_boot = 100`)
+
+A truth config differing from every default placeholder family generated measurements; the analyst's start config had default placeholders plus the datasheet bandwidth and the orbit. **27/29** fitted parameters have the truth inside their 95 % interval; `avf_sram` is excluded (it is a measurement with no hidden truth).
+
+| parameter | truth | fit | 95 % interval | truth inside? |
+|---|---|---|---|---|
+| `compute.pipeline_overlap` | 0.6 | 0.6134 | [0.5628, 0.6687] | yes |
+| `compute.sparse_speedup_at_50` | 1.7 | 1.716 | [1.685, 1.748] | yes |
+| `memory.hbm_efficiency` | 0.72 | 0.7235 | [0.7101, 0.7346] | yes |
+| `orbital.sep_events_per_year` | 4.2 | 4.68 | [3.87, 5.609] | yes |
+| `orbital.sep_intensity_log_sigma` | 1.3 | 1.509 | [1.337, 1.732] | **no** |
+| `orbital.sep_intensity_median` | 0.8 | 0.9048 | [0.6863, 1.193] | yes |
+| `orbital.sep_mean_duration_s` | 1.08e+05 | 1.049e+05 | [8.822e+04, 1.268e+05] | yes |
+| `power.base_power_w` | 63 | 62.37 | [61.93, 62.9] | **no** |
+| `power.clock_frac` | 0.12 | 0.1223 | [0.09117, 0.1522] | yes |
+| `power.leak_temp_coeff` | 3.1 | 3.132 | [3.023, 3.236] | yes |
+| `power.static_frac` | 0.38 | 0.3835 | [0.3635, 0.4039] | yes |
+| `radiation.mbu_cluster_geom_p` | 0.45 | 0.4186 | [0.3547, 0.4854] | yes |
+| `radiation.mbu_prob` | 0.18 | 0.1867 | [0.1575, 0.2198] | yes |
+| `radiation.register.ion.shape` | 1.5 | 1.393 | [0.9029, 2.082] | yes |
+| `radiation.register.ion.sigma_sat_cm2` | 5.5e-14 | 5.445e-14 | [4.774e-14, 6.09e-14] | yes |
+| `radiation.register.ion.width` | 10 | 9.437 | [6.786, 13.07] | yes |
+| `radiation.register.ion.x_th` | 0.9 | 0.889 | [0.075, 1.5] | yes |
+| `radiation.sram.ion.shape` | 1.7 | 2.059 | [1.608, 2.29] | yes |
+| `radiation.sram.ion.sigma_sat_cm2` | 3.2e-14 | 3.381e-14 | [3.124e-14, 3.716e-14] | yes |
+| `radiation.sram.ion.width` | 14 | 15.31 | [13.62, 17.33] | yes |
+| `radiation.sram.ion.x_th` | 1.2 | 0.1945 | [0.075, 1.446] | yes |
+| `radiation.sram.proton.shape` | 1.5 | 1.773 | [0.9969, 2.466] | yes |
+| `radiation.sram.proton.sigma_sat_cm2` | 1.5e-14 | 1.519e-14 | [1.403e-14, 1.709e-14] | yes |
+| `radiation.sram.proton.width` | 35 | 39.45 | [30.9, 49.26] | yes |
+| `radiation.sram.proton.x_th` | 20 | 17.4 | [12.08, 23.34] | yes |
+| `thermal.capacitance_j_per_k` | 320 | 321.3 | [319.6, 323] | yes |
+| `thermal.earth_view_fraction` | 0.32 | 0.3199 | [0.3131, 0.3269] | yes |
+| `thermal.radiator_area_m2` | 0.21 | 0.2099 | [0.2086, 0.2112] | yes |
+| `thermal.sun_projected_fraction` | 0.22 | 0.2195 | [0.2177, 0.2217] | yes |
+
+Note the cross-section rows: `x_th`, `width` and `shape` are individually weakly determined (intervals span factors of 3–15, `x_th` often sits on its search bound — the fit says so), yet the **predicted rate**, which is what the simulator uses, is tight (next table). This is the usual Weibull parameter degeneracy; propagate the rate, do not interpret single Weibull parameters.
+
+### 5.2 Interval coverage over 20 independent campaigns (`n_boot = 100`)
+
+Nominal level 95 %. Measured fraction of intervals containing the truth:
+
+| family | contained | fraction |
+|---|---|---|
+| MBU | 39/40 | 97.5 % |
+| SEP | 78/80 | 97.5 % |
+| power | 77/80 | 96.3 % |
+| thermal | 76/80 | 95.0 % |
+| performance | 57/60 | 95.0 % |
+| cross-section (beam) | 220/240 | **91.7 %** (percentile parametric bootstrap under-covers slightly at these counts; σ_sat alone: 88 % over 40 repeats) |
+| **all** | **547/580** | **94.3 %** |
+| predicted SRAM upset rate (95 % interval) | 18/20 | 90 % — median error −0.6 %, 90 % of campaigns within ±6.8 %; **the shipped placeholder was −68.5 % off** |
+
+The demo campaign above (seed 2024) happens to land at 25/29; its four misses are 2.1–2.6 standard errors (three are the correlated power parameters `static_frac`, `leak_temp_coeff`, `clock_frac` from a single 18-point noise realisation; one is `sep_intensity_median`). No parameter in either run misses by more than 2.6 s.e.
+
+Goodness-of-fit p-values for the Weibull fit are well calibrated (40 repeats: mean 0.48, 7 % below 0.05). Closed-form and conjugate checks: MBU interval coverage ≥ 92 %, SEP Garwood/χ² coverage ≥ 92 %, Jeffreys Gamma coverage ≥ 93 %, flight importance-weighting reproduces the exact Poisson–Gamma posterior (median within 2 %, interval within 5 %).
+
+### 5.3 What calibration does to simulator outputs
+
+3000 s LEO mission, 4-layer INT8 transformer (`run_mission`, same seed for all three):
+
+| config | avg power | dense TFLOPS | mean T | max T |
+|---|---|---|---|---|
+| truth | 40.53 W | 87.76 | 284.92 K | 295.74 K |
+| **calibrated** | **40.22 W (-0.8 %)** | **88.18 (+0.5 %)** | **284.59 K (-0.33)** | 295.34 K |
+| shipped placeholders | 30.11 W (-25.7 %) | 101.66 (+15.8 %) | 263.66 K (-21.26) | 290.00 K |
+
+Orbit-static SRAM upset rate (per bit per day): truth 8.534e-10; placeholder 2.685e-10; calibrated 8.432e-10 [7.867e-10, 9.098e-10]; after the flight log 8.336e-10 [7.868e-10, 8.948e-10] (flight: 319 observed vs 323 expected, consistency p = 0.89). Flight data tighten the interval by ≈ 30 %.
+
+### 5.4 Test suite and mutation check
+
+237 tests: `test_cal_data` 34 · `test_cal_radiation` 31 · `test_cal_hardware` 22 · `test_cal_workflow` 21 · `test_radiation` 38 · `test_simulator` 20 · `test_memory` 18 · `test_thermal` 16 · `test_rng_config` 16 · `test_orbit` 13 · `test_faults` 8. Eleven are marked `slow` (repeated-campaign statistics, ≈ 75 s total; whole suite ≈ 3 min). Line coverage 98 % (the 3-line `__main__.py` is exercised through a subprocess test that coverage does not trace).
+
+`python tools/mutation_check.py` re-introduces 46 defects into a scratch copy and requires the relevant non-slow tests to fail: **46/46 killed** — the 15 original v2 defects plus 31 calibration defects (NLL sign, missing deviance factor, bootstrap that does not resample, un-widened over-dispersed intervals, inverted MBU/SEP/flight estimators, cos-vs-1/cos LET, tilt not applied to fluence, power static/dynamic swap, wrong eclipse-interval convention, disabled identifiability check, config mutated in place, step failures reported as ok, …).
+
+## 6. Defects found while building and validating this (kept, because they change how to trust the results)
+
+1. **A bound I set was silently biasing a fit.** The performance fit capped launch overhead at 0.9 × the fastest measurement; the true value exceeded it, the parameter pinned at its bound and the other three compensated. Symptom: noise-free data recovered overlap 0.587 instead of 0.600 and residual rms 0.034 against 0.02 injected noise. Fixed (bound 0.999×); nuisance parameters at bounds are now flagged; a mutant re-introducing it is killed. *My earlier "truth inside the interval" results for this fit were partly luck.*
+2. **Zero Jacobian from a staircase.** `ceil()` in the cycle count made the sparse-speedup derivative exactly zero at finite-difference scale; the parameter looked non-identifiable. Fits now use a smooth cycle count (`estimate_layer(..., exact_cycles=False)`, < 1 cycle per tile difference); the simulator keeps the exact count.
+3. **Unit-dependent identifiability.** A column in seconds (launch overhead) dominated the condition number and made other parameters look weak. Conditioning and weak-parameter detection now use range-scaled Jacobians (condition 3×10⁵ → 5 for the same data).
+4. **A fatal error where a graceful one was right.** A non-binding regime produced a zero-sensitivity column and aborted the whole fit. Now it is dropped and reported unresolved while the rest fit. The *test* I first wrote for this exercised a different code path; the mutation check exposed the survivor and I added the missing scenario.
+5. **Misleading narrow interval.** The register rate showed [2.687, 2.689]×10⁻¹⁰ because its dominant proton cross-section was an unresolved placeholder. Reports now state the share of each rate resting on placeholders.
+6. **Weak warnings.** The "saturation not reached" test missed data stopping at 71 % of σ_sat; unphysical thermal loads (projected-area fraction 1.5) produced no warning.
+7. **Vacuous tests.** `pytest.approx` has a default absolute tolerance of 10⁻¹²; every comparison of ≈10⁻¹⁵ rates was trivially true. All rate comparisons now use `abs=0`. Two of my physical premises were then shown wrong by real failures: in the placeholder LEO model the SRAM rate is ≈ 10⁴× dominated by trapped protons, so solar activity and inclination barely move it.
+8. **Statistically flawed single-seed assertions.** Asserting four 95 % intervals contain the truth in one seed fails ≈ 19 % of the time by construction. Single-seed tests now check |estimate − truth| ≤ 3.5 s.e.; nominal coverage is tested over repeated campaigns.
+9. **Config hash instability** (`1` vs `1.0` in a table) — canonicalised to floats.
+
+Consequence worth knowing: **in LEO the proton cross-section calibration dominates the SRAM rate**; ion (LET) beam data mostly matter for GEO/deep space and for SEP events. Plan beam time accordingly.
+
+## 7. Limitations — what this does not do
+
+- **Synthetic validation only** (see the note at the top). Model-form error is untested: if real devices deviate from Weibull σ(x), a lumped thermal node, or the roofline, the fits will still converge and report intervals that are too narrow. Over-dispersion, the GOF p-value, residual rms and the flight-consistency check are the only guards; consider `flight_discrepancy_log_sigma` > 0 once you understand the mismatch.
+- **Beam-fit intervals under-cover slightly** (91.7 %), and the Wald/MVN intervals for power/thermal/performance assume near-linear behaviour and are invalid for parameters at bounds (flagged).
+- **Independence assumptions.** Families are fitted and drawn independently (no power↔thermal correlation through shared temperature, none between cross-section regions). Draws within a family are joint.
+- **Flight update and beam data** are combined as a Bayesian update of the draws; do not additionally scale cross-sections by a flight factor.
+- **Environment tables are external inputs** and are trusted: flux below the first table point is treated as zero (flagged if it matters); flux above the last point is lumped there. SEP tables must describe the reference event of intensity 1 that the SEP-catalogue intensities are relative to. Trapped-proton SAA time-dependence is not modelled (orbit-averaged tables).
+- **SEL** is rare: zero-event datasets are refused with a 95 % upper limit (`cross_section_upper_limit`); no Weibull is fitted to them.
+- **Register/logic AVF, SET pulse width, gate/flop counts, TMR residual, interconnect split** cannot be inferred from these datasets and stay unresolved until `declare()`d.
+- **Only 2:4 sparsity**, one array dataflow (output-stationary), single dtype per benchmark row.
+- Fits are single-device: no population/lot variation, no temperature dependence of cross-sections, no beam-angle azimuth effects.
+
+---
+
+## 8. Source code
+
+### `uchu/__init__.py`
+
+```python
+"""Uchu Gijutsu v3 -- space-AI accelerator simulator (single clock, cross-section radiation core)."""
+from .config import (ComputeConfig, CrossSection, DType, DVFSConfig, MemoryConfig, OrbitalConfig,
+                     OrbitType, PowerConfig, ProcessNode, RadiationConfig, SimConfig, SolarActivity,
+                     ThermalConfig)
+from .faults import flip_bit, measure_gemm_vulnerability
+from .memory import (WorkloadLayer, build_transformer_workload, estimate_layer, profile_pass,
+                     structured_sparsity_speedup)
+from .provenance import MODEL_VERSION, provenance
+from .radiation import (EccMemory, RadiationEnvironment, RadiationStats, RadiationSubsystem,
+                        TruncatedPowerLaw, integral_rate)
+from .rng import child_seed, make_rng
+from .simulator import ChipSimulator, run_ensemble, run_mission, run_workload
+from .thermal import LumpedThermalModel, PowerModel
+
+__version__ = MODEL_VERSION
+```
+
+### `uchu/rng.py`
+
+```python
+"""Deterministic, isolated random-number streams.
+
+v3 never touches NumPy's / Python's / Torch's *global* RNG state.  Every
+stochastic component asks for its own named stream derived from one master
+seed via ``numpy.random.SeedSequence`` (``spawn_key`` = CRC32 of each key).
+Streams with different keys are statistically independent; identical
+(seed, keys) always reproduce identical streams, in any process.
+"""
+from __future__ import annotations
+
+import zlib
+
+import numpy as np
+
+
+def _spawn_key(keys) -> tuple:
+    return tuple(zlib.crc32(str(k).encode("utf-8")) for k in keys)
+
+
+def make_rng(seed: int, *keys) -> np.random.Generator:
+    """Independent Generator for (seed, *keys)."""
+    ss = np.random.SeedSequence(entropy=int(seed), spawn_key=_spawn_key(keys))
+    return np.random.default_rng(ss)
+
+
+def child_seed(seed: int, *keys) -> int:
+    """Integer seed derived from (seed, *keys); safe to ship to worker processes."""
+    ss = np.random.SeedSequence(entropy=int(seed), spawn_key=_spawn_key(keys))
+    return int(ss.generate_state(1, dtype=np.uint64)[0] % (2**63 - 1))
+```
+
+### `uchu/stats.py`
+
+```python
+"""Small statistics helpers (exact Poisson intervals, Wilson, bootstrap)."""
+from __future__ import annotations
+
+import math
+from typing import Optional, Tuple
+
+import numpy as np
+from scipy.stats import chi2, norm
+
+
+def poisson_rate_ci(k: int, exposure: float, conf: float = 0.95) -> Tuple[float, float]:
+    """Exact (Garwood) two-sided CI for a Poisson rate = k / exposure."""
+    if exposure <= 0:
+        return (0.0, math.inf)
+    alpha = 1.0 - conf
+    lo = 0.0 if k == 0 else 0.5 * chi2.ppf(alpha / 2.0, 2 * k)
+    hi = 0.5 * chi2.ppf(1.0 - alpha / 2.0, 2 * (k + 1))
+    return lo / exposure, hi / exposure
+
+
+def wilson_ci(successes: int, n: int, conf: float = 0.95) -> Tuple[float, float]:
+    """Wilson score interval for a binomial proportion."""
+    if n <= 0:
+        return (0.0, 1.0)
+    z = norm.ppf(0.5 + conf / 2.0)
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def bootstrap_ci(data, n_boot: int = 2000, conf: float = 0.95,
+                 rng: Optional[np.random.Generator] = None) -> Tuple[float, float]:
+    """Percentile bootstrap CI for the mean (vectorised)."""
+    data = np.asarray(data, float)
+    rng = rng or np.random.default_rng(0)
+    idx = rng.integers(0, len(data), size=(n_boot, len(data)))
+    means = data[idx].mean(axis=1)
+    a = (1 - conf) / 2
+    return float(np.quantile(means, a)), float(np.quantile(means, 1 - a))
+```
+
+### `uchu/config.py`
+
+```python
+"""Configuration for Uchu Gijutsu v3.
+
+Every parameter that is a *placeholder awaiting external calibration* is
+marked ``# PLACEHOLDER`` and listed in the provenance table in the docs.
+"""
+from __future__ import annotations
+
+import copy
+import dataclasses
+import hashlib
+import json
+import math
+import typing
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Enumerations
+# ---------------------------------------------------------------------------
+_NODE = {
+    "fmax": {"N28": 1.2, "N16": 1.8, "N7": 2.5, "N5": 3.0, "N3": 3.5},
+    "vmin": {"N28": 0.75, "N16": 0.70, "N7": 0.65, "N5": 0.60, "N3": 0.55},
+    "vmax": {"N28": 1.05, "N16": 1.00, "N7": 0.90, "N5": 0.85, "N3": 0.80},
+    "leak": {"N28": 1.0, "N16": 1.4, "N7": 2.1, "N5": 2.8, "N3": 3.5},   # PLACEHOLDER (static power / mm^2)
+    "cap": {"N28": 1.6, "N16": 1.25, "N7": 1.0, "N5": 0.85, "N3": 0.72},  # PLACEHOLDER (switched C / MAC)
+}
+
+
+class ProcessNode(Enum):
+    N28 = "28nm"
+    N16 = "16nm"
+    N7 = "7nm"
+    N5 = "5nm"
+    N3 = "3nm"
+
+    def max_freq_ghz(self) -> float:
+        return _NODE["fmax"][self.name]
+
+    def min_voltage(self) -> float:
+        return _NODE["vmin"][self.name]
+
+    def max_voltage(self) -> float:
+        return _NODE["vmax"][self.name]
+
+    def leakage_factor(self) -> float:
+        return _NODE["leak"][self.name]
+
+    def cap_factor(self) -> float:
+        return _NODE["cap"][self.name]
+
+
+class DType(Enum):
+    """(label, bytes/element, MAC throughput per PE per cycle relative to a native INT8 PE).
+
+    v3 FIX: v2 stored ``relative_ops`` = 1.0/0.5/0.25 for FP32/FP16/INT8, i.e.
+    *lower* throughput for narrower types.  Narrow types are faster per PE.
+    """
+    FP32 = ("fp32", 4.0, 0.25)
+    FP16 = ("fp16", 2.0, 0.5)
+    BF16 = ("bf16", 2.0, 0.5)
+    FP8 = ("fp8", 1.0, 1.0)
+    INT8 = ("int8", 1.0, 1.0)
+    INT4 = ("int4", 0.5, 2.0)
+
+    def __init__(self, label: str, bytes_per_elem: float, pe_throughput: float):
+        self.label = label
+        self.bytes_per_elem = bytes_per_elem
+        self.pe_throughput = pe_throughput
+
+
+class OrbitType(Enum):
+    LEO = "Low Earth Orbit"
+    MEO = "Medium Earth Orbit"
+    GEO = "Geostationary Orbit"
+    DEEP = "Deep Space"
+
+
+class SolarActivity(Enum):
+    LOW = "solar_min"
+    MODERATE = "moderate"
+    HIGH = "solar_max"
+
+
+_DEFAULT_ALT_KM = {OrbitType.LEO: 550.0, OrbitType.MEO: 20200.0,
+                   OrbitType.GEO: 35786.0, OrbitType.DEEP: 0.0}
+
+# ---------------------------------------------------------------------------
+# Sub-configs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MemoryConfig:
+    hbm_bw_tb_s_per_stack: float = 1.0      # TB/s per stack
+    num_hbm_stacks: int = 2
+    onchip_sram_mb: float = 64.0
+    ecc_enabled: bool = True
+    ecc_bw_overhead_pct: float = 12.5       # PLACEHOLDER
+    hbm_efficiency: float = 1.0             # PLACEHOLDER: achieved / peak HBM bandwidth (excl. ECC overhead)
+
+
+@dataclass
+class PowerConfig:
+    base_power_w: float = 50.0     # total power at reference config, nominal V/f, T_nom, util=1
+    static_frac: float = 0.45      # fraction of base power that is leakage; dynamic = 1 - static
+    clock_frac: float = 0.08       # fraction of *dynamic* power in the clock tree (always toggling)
+    interconnect_frac: float = 0.05  # fraction of *dynamic* power in interconnect
+    interconnect_extra_exponent: float = 0.5  # PLACEHOLDER: wire power ~ array_ratio**exp beyond MAC scaling
+    leak_temp_coeff: float = 3.5   # PLACEHOLDER: P_leak ~ exp(k (T-Tnom)/Tnom)
+    T_nom_k: float = 300.0
+    T_max_k: float = 390.0
+    ref_area_mm2: float = 400.0
+    ref_array_size: int = 256
+    ref_node: str = "N7"
+
+
+@dataclass
+class DVFSConfig:
+    nom_freq_ghz: float = 1.5
+    nom_voltage_v: float = 0.9
+    voltage_scaling: bool = True
+    throttle_onset_k: float = 370.0
+    throttle_slope_per_k: float = 0.02   # fractional f reduction per K above onset
+    throttle_floor: float = 0.1
+
+
+@dataclass
+class ThermalConfig:
+    """Single lumped node (chip + board + radiator).  No junction-to-radiator resistance."""
+    capacitance_j_per_k: float = 500.0   # ~0.55 kg of Al-equivalent; v2 used 0.5 J/K (unphysical)
+    radiator_area_m2: float = 0.25
+    emissivity: float = 0.85
+    view_factor: float = 0.85
+    degradation_per_year: float = 0.02
+    mission_year: float = 0.0
+    absorptance: float = 0.15
+    solar_flux_w_m2: float = 1361.0
+    sun_projected_fraction: float = 0.15  # PLACEHOLDER (attitude-dependent)
+    earth_ir_w_m2: float = 237.0
+    albedo: float = 0.30
+    earth_view_fraction: float = 0.25     # PLACEHOLDER
+    albedo_geometry: float = 0.5          # PLACEHOLDER
+    T_init_k: float = 290.0
+    max_substep_s: float = 5.0
+
+
+@dataclass
+class OrbitalConfig:
+    orbit_type: OrbitType = OrbitType.LEO
+    altitude_km: float = 550.0
+    inclination_deg: float = 51.6
+    beta_deg: float = 0.0
+    solar_activity: SolarActivity = SolarActivity.MODERATE
+    eclipse_fraction_override: Optional[float] = None
+    # SEP-event statistics.  None / defaults reproduce the v3.0 built-in table.   PLACEHOLDER until fitted
+    sep_events_per_year: Optional[float] = None
+    sep_mean_duration_s: float = 12 * 3600.0
+    sep_intensity_median: float = 1.0          # relative to the reference event embodied in the SEP spectra
+    sep_intensity_log_sigma: float = 1.0
+
+    @classmethod
+    def for_orbit(cls, orbit_type: OrbitType, **kw) -> "OrbitalConfig":
+        kw.setdefault("altitude_km", _DEFAULT_ALT_KM[orbit_type])
+        return cls(orbit_type=orbit_type, **kw)
+
+
+@dataclass
+class ComputeConfig:
+    array_size: int = 256
+    process_node: ProcessNode = ProcessNode.N7
+    area_mm2: float = 400.0
+    sparse_speedup_at_50: float = 1.85   # PLACEHOLDER: measured 2:4 compute speedup (<2 due to metadata/overhead)
+    pipeline_overlap: float = 0.0        # fraction of per-tile fill/drain hidden by tile-to-tile pipelining
+                                         # (0 = fully exposed = conservative; 1 = only one fill/drain per layer)
+
+
+@dataclass
+class CrossSection:
+    """Weibull SEE cross-section sigma(x).  x = LET [MeV cm2/mg] (ions) or E [MeV] (protons).
+    ``sigma_sat_cm2`` is per bit / per flip-flop / per gate / per device depending on region."""
+    sigma_sat_cm2: float
+    x_th: float
+    width: float
+    shape: float
+
+    def __call__(self, x):
+        x = np.asarray(x, dtype=float)
+        z = np.clip((x - self.x_th) / self.width, 0.0, None)
+        return self.sigma_sat_cm2 * (1.0 - np.exp(-np.power(z, self.shape)))
+
+
+@dataclass
+class RegionXS:
+    ion: CrossSection
+    proton: CrossSection
+
+
+@dataclass
+class SpectrumParams:
+    """Truncated power-law integral flux  Phi(>x) = phi_ref [ (x/x_ref)^-g - (x_max/x_ref)^-g ], x < x_max.
+    Units: particles / cm2 / s (omnidirectional)."""
+    phi_ref: float
+    x_ref: float
+    gamma: float
+    x_max: float
+
+
+@dataclass
+class SpectrumTable:
+    """Integral flux table Phi(>x) [particles/cm2/s] vs x (LET [MeV cm2/mg] or E [MeV]) from CREME96/OMERE/SPENVIS."""
+    x: List[float]
+    phi_integral: List[float]
+
+    def __post_init__(self):                       # canonical floats => stable config hash
+        self.x = [float(v) for v in self.x]
+        self.phi_integral = [float(v) for v in self.phi_integral]
+
+
+_SPECTRUM_KEYS = ("gcr_ion", "trapped_proton", "sep_ion", "sep_proton")
+
+
+@dataclass
+class RadiationConfig:
+    # --- device cross-sections (ALL PLACEHOLDER: replace with beam-test Weibull fits) ---
+    sram: RegionXS = field(default_factory=lambda: RegionXS(
+        CrossSection(1e-14, 0.5, 20.0, 1.5), CrossSection(3e-15, 10.0, 30.0, 1.5)))
+    register: RegionXS = field(default_factory=lambda: RegionXS(
+        CrossSection(2e-14, 0.5, 20.0, 1.5), CrossSection(3e-15, 10.0, 30.0, 1.5)))
+    logic_set: RegionXS = field(default_factory=lambda: RegionXS(      # per gate
+        CrossSection(1e-15, 2.0, 20.0, 1.5), CrossSection(1e-16, 15.0, 30.0, 1.5)))
+    sel: RegionXS = field(default_factory=lambda: RegionXS(            # per device
+        CrossSection(1e-4, 30.0, 30.0, 2.0), CrossSection(0.0, 30.0, 30.0, 2.0)))
+    # --- environment spectra (PLACEHOLDER: replace with CREME96/OMERE/AP-9 exports) ---
+    gcr_ion: SpectrumParams = field(default_factory=lambda: SpectrumParams(2e-3, 1.0, 1.6, 150.0))
+    trapped_proton: SpectrumParams = field(default_factory=lambda: SpectrumParams(5.0, 10.0, 1.0, 400.0))
+    sep_ion: SpectrumParams = field(default_factory=lambda: SpectrumParams(0.1, 1.0, 2.5, 30.0))
+    sep_proton: SpectrumParams = field(default_factory=lambda: SpectrumParams(100.0, 10.0, 2.0, 300.0))
+    # 'scaled_placeholder': power-law spectra x placeholder orbit scalings.
+    # 'tabulated_orbit'   : `tables` are orbit-specific & already shielded; NO scalings are applied.
+    environment_mode: str = "scaled_placeholder"
+    tables: Dict[str, SpectrumTable] = field(default_factory=dict)
+    let_grid_lo: float = 1e-2
+    energy_grid_lo: float = 1.0
+    shield_mm_al: float = 2.0
+    shield_atten_len_mm: float = 10.0       # PLACEHOLDER (protons)
+    # --- memory / ECC ---
+    mbu_prob: float = 0.10                   # PLACEHOLDER: P(cluster | SRAM SEU)
+    mbu_max_cluster: int = 6
+    mbu_cluster_geom_p: float = 0.5          # PLACEHOLDER: P(stop) of the truncated-geometric cluster size
+    ecc_word_bits: int = 64
+    ecc_interleave: int = 4
+    secded_odd_miscorrect_prob: float = 1.0  # conservative: odd >=3-bit errors alias to a 1-bit syndrome
+    scrub_interval_s: float = 1.0
+    # --- architectural derating (1.0 = conservative upper bound; set from fault injection) ---
+    avf_sram: float = 1.0
+    avf_register: float = 1.0
+    avf_logic: float = 1.0
+    reg_bits_per_pe: int = 48
+    gates_per_pe: int = 1500                 # PLACEHOLDER
+    set_pulse_width_ps: float = 150.0        # PLACEHOLDER
+    tmr_enabled: bool = False
+    tmr_residual: float = 1e-3               # PLACEHOLDER: voter / common-cause fraction left under TMR
+    # --- latch-up ---
+    sel_protected: bool = True
+    sel_recovery_s: float = 5.0
+    sel_destructive_prob_unprotected: float = 1.0
+
+
+@dataclass
+class SimConfig:
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    power: PowerConfig = field(default_factory=PowerConfig)
+    dvfs: DVFSConfig = field(default_factory=DVFSConfig)
+    thermal: ThermalConfig = field(default_factory=ThermalConfig)
+    orbital: OrbitalConfig = field(default_factory=OrbitalConfig)
+    compute: ComputeConfig = field(default_factory=ComputeConfig)
+    radiation: RadiationConfig = field(default_factory=RadiationConfig)
+    random_seed: int = 42
+    calibration: Dict[str, dict] = field(default_factory=dict)   # dotted path -> provenance entry
+
+    # ------------------------------------------------------------------
+    def validate(self) -> "SimConfig":
+        def need(cond: bool, msg: str):
+            if not cond:
+                raise ValueError(f"invalid SimConfig: {msg}")
+        c, p, d, t, r, o, m = (self.compute, self.power, self.dvfs, self.thermal,
+                               self.radiation, self.orbital, self.memory)
+        need(c.array_size > 0, "array_size must be > 0")
+        need(c.area_mm2 > 0, "area_mm2 must be > 0")
+        need(0.0 <= p.static_frac < 1.0, "static_frac must be in [0,1)")
+        need(p.clock_frac + p.interconnect_frac < 1.0, "clock_frac + interconnect_frac must be < 1")
+        need(p.base_power_w > 0, "base_power_w must be > 0")
+        need(p.T_nom_k < p.T_max_k, "T_nom_k < T_max_k")
+        need(d.nom_freq_ghz > 0, "nom_freq_ghz must be > 0")
+        need(c.process_node.min_voltage() <= d.nom_voltage_v <= c.process_node.max_voltage(),
+             f"nom_voltage_v outside {c.process_node.value} range")
+        need(d.nom_freq_ghz <= c.process_node.max_freq_ghz(), "nom_freq_ghz exceeds node maximum")
+        need(0.0 < d.throttle_floor <= 1.0, "throttle_floor must be in (0,1]")
+        need(t.capacitance_j_per_k > 0 and t.radiator_area_m2 > 0, "thermal capacitance/area must be > 0")
+        need(0.0 < t.emissivity <= 1.0 and 0.0 < t.view_factor <= 1.0, "emissivity/view_factor in (0,1]")
+        need(m.onchip_sram_mb > 0 and m.hbm_bw_tb_s_per_stack > 0 and m.num_hbm_stacks > 0, "memory sizes > 0")
+        need(0.0 <= r.mbu_prob <= 1.0 and r.mbu_max_cluster >= 2, "mbu params")
+        need(r.ecc_interleave >= 1 and r.ecc_word_bits >= 1, "ecc geometry")
+        need(r.scrub_interval_s > 0, "scrub_interval_s must be > 0")
+        for name in ("avf_sram", "avf_register", "avf_logic", "secded_odd_miscorrect_prob"):
+            need(0.0 <= getattr(r, name) <= 1.0, f"{name} in [0,1]")
+        need(0.0 <= o.inclination_deg <= 180.0, "inclination_deg in [0,180]")
+        if o.eclipse_fraction_override is not None:
+            need(0.0 <= o.eclipse_fraction_override < 1.0, "eclipse_fraction_override in [0,1)")
+        need(c.sparse_speedup_at_50 >= 1.0, "sparse_speedup_at_50 >= 1")
+        need(0.0 <= c.pipeline_overlap <= 1.0, "pipeline_overlap in [0,1]")
+        need(0.0 < m.hbm_efficiency <= 1.0, "hbm_efficiency in (0,1]")
+        need(0.0 < r.mbu_cluster_geom_p <= 1.0, "mbu_cluster_geom_p in (0,1]")
+        need(r.environment_mode in ("scaled_placeholder", "tabulated_orbit"), "unknown environment_mode")
+        need(o.sep_mean_duration_s > 0 and o.sep_intensity_median > 0 and o.sep_intensity_log_sigma >= 0,
+             "SEP statistics must be positive")
+        need(o.sep_events_per_year is None or o.sep_events_per_year >= 0, "sep_events_per_year >= 0")
+        for key, tab in r.tables.items():
+            need(key in _SPECTRUM_KEYS, f"unknown spectrum table '{key}'")
+            xs_, ph_ = np.asarray(tab.x, float), np.asarray(tab.phi_integral, float)
+            need(len(xs_) >= 2 and len(xs_) == len(ph_), f"table '{key}' needs >= 2 matched points")
+            need(bool(np.all(np.diff(xs_) > 0) and np.all(xs_ > 0)), f"table '{key}': x must be positive ascending")
+            need(bool(np.all(ph_ >= 0) and np.all(np.diff(ph_) <= 0)), f"table '{key}': flux must be >= 0, non-increasing")
+        need(r.environment_mode != "tabulated_orbit" or len(r.tables) > 0, "tabulated_orbit needs at least one table")
+        # cross-section grids must start below every threshold, or flux would be silently dropped
+        for reg in (r.sram, r.register, r.logic_set, r.sel):
+            need(reg.ion.x_th > r.let_grid_lo, "ion x_th must exceed let_grid_lo")
+            need(reg.proton.x_th > r.energy_grid_lo, "proton x_th must exceed energy_grid_lo")
+        return self
+
+    # ------------------------------------------------------------------
+    def copy(self) -> "SimConfig":
+        return copy.deepcopy(self)
+
+    def to_dict(self) -> dict:
+        return json.loads(json.dumps(asdict(self), default=str))
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(asdict(self), indent=indent, default=str, sort_keys=True)
+
+    def config_hash(self) -> str:
+        return hashlib.sha256(self.to_json(indent=0).encode()).hexdigest()[:16]
+
+    # ---- round trip -------------------------------------------------------
+    @classmethod
+    def from_dict(cls, d: dict) -> "SimConfig":
+        return _dc_from_dict(cls, d)
+
+    @classmethod
+    def from_json(cls, text: str) -> "SimConfig":
+        return cls.from_dict(json.loads(text))
+
+
+# ---------------------------------------------------------------------------
+# Generic dict -> dataclass reconstruction (enums, nested dataclasses, Optional, Dict, List)
+# ---------------------------------------------------------------------------
+def _build(tp, val):
+    if val is None:
+        return None
+    origin, args = typing.get_origin(tp), typing.get_args(tp)
+    if dataclasses.is_dataclass(tp):
+        return _dc_from_dict(tp, val)
+    if isinstance(tp, type) and issubclass(tp, Enum):
+        return tp[val.split(".")[-1]] if isinstance(val, str) else tp(val)
+    if origin is typing.Union:
+        inner = [a for a in args if a is not type(None)]
+        return _build(inner[0], val)
+    if origin in (dict, Dict):
+        return {k: _build(args[1], v) for k, v in val.items()}
+    if origin in (list, List):
+        return [_build(args[0], v) for v in val]
+    if tp is float:
+        return float(val)
+    if tp is int:
+        return int(val)
+    return val
+
+
+def _dc_from_dict(cls, d: dict):
+    hints = typing.get_type_hints(cls)
+    names = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(d) - names
+    if unknown:
+        raise ValueError(f"{cls.__name__}: unknown field(s) {sorted(unknown)}")
+    return cls(**{k: _build(hints[k], v) for k, v in d.items()})
+```
+
+### `uchu/memory.py`
+
+```python
+"""Roofline / performance model.
+
+v3 fixes vs v2
+  * arithmetic intensity & traffic use the real GEMM dims (M, K, N), not M alone
+  * HBM traffic from an explicit blocking model (operand re-reads when SRAM is too small)
+  * the layer's own dtype is used (v2 used a global dtype)
+  * sparsity is applied ONCE (executed work shrinks; peak throughput is unchanged)
+  * array tiling quantisation and pipeline fill/drain are modelled via an exact cycle count
+    (fill/drain fully exposed per tile unless ComputeConfig.pipeline_overlap > 0: conservative)
+  * the inverted dtype throughput table is corrected (see config.DType)
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List
+
+from .config import DType, SimConfig
+
+
+@dataclass(frozen=True)
+class WorkloadLayer:
+    name: str
+    kind: str
+    M: int
+    K: int
+    N: int
+    dtype: DType = DType.INT8
+    sparsity: float = 0.0   # 0.0 (dense) or 0.5 (2:4 structured) -- the only patterns hardware supports
+
+    def __post_init__(self):
+        if min(self.M, self.K, self.N) <= 0:
+            raise ValueError(f"layer {self.name}: M, K, N must be positive")
+        if self.sparsity not in (0.0, 0.5):
+            raise ValueError(f"layer {self.name}: only 0.0 or 0.5 (2:4) sparsity is supported, "
+                             f"got {self.sparsity}")
+
+    @property
+    def dense_flops(self) -> float:
+        return 2.0 * self.M * self.K * self.N
+
+
+def structured_sparsity_speedup(sparsity: float, speedup_at_50: float = 1.85) -> float:
+    """Compute-bound speedup of 2:4 structured sparsity.  All-or-nothing: 0.0 -> 1, 0.5 -> speedup_at_50."""
+    if sparsity == 0.0:
+        return 1.0
+    if sparsity == 0.5:
+        return float(speedup_at_50)
+    raise ValueError("2:4 hardware supports only sparsity 0.0 or 0.5")
+
+
+def weight_bytes_factor(sparsity: float, bytes_per_elem: float) -> float:
+    """Stored weight bytes relative to dense: kept values + 2-bit index per kept value."""
+    if sparsity == 0.0:
+        return 1.0
+    kept = 1.0 - sparsity
+    return kept * (1.0 + 2.0 / (8.0 * bytes_per_elem))
+
+
+@dataclass(frozen=True)
+class LayerPerf:
+    name: str
+    duration_s: float
+    t_compute_s: float
+    t_memory_s: float
+    memory_bound: bool
+    dense_flops: float
+    executed_flops: float
+    hbm_bytes: float
+    arithmetic_intensity: float      # executed flops / HBM byte
+    ridge_point: float               # flops/byte at which compute == memory roofs
+    util: float                      # fraction of peak MAC slots doing useful work, in [0,1]
+    resident_sram_bits: float
+    peak_exec_tflops: float
+
+
+def hbm_bandwidth_bytes_s(cfg: SimConfig) -> float:
+    m = cfg.memory
+    eff = 1.0 / (1.0 + m.ecc_bw_overhead_pct / 100.0) if m.ecc_enabled else 1.0
+    return m.hbm_bw_tb_s_per_stack * 1e12 * m.num_hbm_stacks * eff * m.hbm_efficiency
+
+
+def estimate_layer(layer: WorkloadLayer, cfg: SimConfig, freq_ghz: float, exact_cycles: bool = True) -> LayerPerf:
+    """``exact_cycles=False`` drops the ceil() on the reduction depth (< 1 cycle per tile): used only by the calibration fits,
+    whose objective must be smooth in ``sparse_speedup_at_50``."""
+    A = cfg.compute.array_size
+    b = layer.dtype.bytes_per_elem
+    thr = layer.dtype.pe_throughput
+    f_hz = freq_ghz * 1e9
+    M, K, N = layer.M, layer.K, layer.N
+
+    spd = structured_sparsity_speedup(layer.sparsity, cfg.compute.sparse_speedup_at_50)
+    K_eff = K / spd                                   # executed reduction depth
+
+    # --- compute: output-stationary AxA array, exact cycle count -----------------
+    tiles = math.ceil(M / A) * math.ceil(N / A)
+    fill = 2 * A - 2                                        # systolic fill + drain skew
+    k_cycles = math.ceil(K_eff / thr) if exact_cycles else K_eff / thr
+    cycles = (tiles * k_cycles
+              + fill * (1.0 + (tiles - 1) * (1.0 - cfg.compute.pipeline_overlap)))
+    t_compute = cycles / f_hz
+    ideal_cycles = M * N * K_eff / (A * A * thr)
+
+    # --- memory: blocked GEMM traffic ---------------------------------------------
+    sram_bytes = cfg.memory.onchip_sram_mb * 2**20
+    T = max(1, int(math.sqrt(sram_bytes / (3.0 * b))))      # square tile edge, 3 operand tiles resident
+    wfac = weight_bytes_factor(layer.sparsity, b)
+    hbm_bytes = b * (M * K * math.ceil(N / T)
+                     + wfac * K * N * math.ceil(M / T)
+                     + M * N)
+    bw = hbm_bandwidth_bytes_s(cfg)
+    t_mem = hbm_bytes / bw
+
+    duration = max(t_compute, t_mem)
+    executed = 2.0 * M * N * K_eff
+    peak_exec = 2.0 * A * A * f_hz * thr
+    util = min(1.0, ideal_cycles / (duration * f_hz))
+    working_set_bits = 8.0 * b * (M * K + wfac * K * N + M * N)
+    resident = min(sram_bytes * 8.0, working_set_bits)
+
+    return LayerPerf(
+        name=layer.name, duration_s=duration, t_compute_s=t_compute, t_memory_s=t_mem,
+        memory_bound=t_mem > t_compute, dense_flops=layer.dense_flops, executed_flops=executed,
+        hbm_bytes=hbm_bytes, arithmetic_intensity=executed / hbm_bytes,
+        ridge_point=peak_exec / bw, util=util, resident_sram_bits=resident,
+        peak_exec_tflops=peak_exec / 1e12)
+
+
+@dataclass(frozen=True)
+class PassProfile:
+    """Time-weighted summary of one forward pass at a fixed clock."""
+    duration_s: float
+    dense_flops: float
+    executed_flops: float
+    util: float
+    live_sram_bits: float
+    memory_bound_fraction: float
+    layers: tuple
+
+
+def profile_pass(layers: List[WorkloadLayer], cfg: SimConfig, freq_ghz: float) -> PassProfile:
+    perfs = [estimate_layer(l, cfg, freq_ghz) for l in layers]
+    dur = sum(p.duration_s for p in perfs)
+    return PassProfile(
+        duration_s=dur,
+        dense_flops=sum(p.dense_flops for p in perfs),
+        executed_flops=sum(p.executed_flops for p in perfs),
+        util=sum(p.util * p.duration_s for p in perfs) / dur,
+        live_sram_bits=sum(p.resident_sram_bits * p.duration_s for p in perfs) / dur,
+        memory_bound_fraction=sum(p.duration_s for p in perfs if p.memory_bound) / dur,
+        layers=tuple(perfs))
+
+
+def build_transformer_workload(seq_len: int = 512, hidden_dim: int = 1024, num_heads: int = 16,
+                               num_layers: int = 12, ffn_mult: int = 4, batch_size: int = 1,
+                               dtype: DType = DType.INT8, sparsity: float = 0.0) -> List[WorkloadLayer]:
+    d, ff, B, S = hidden_dim, hidden_dim * ffn_mult, batch_size, seq_len
+    hd = d // num_heads
+    out: List[WorkloadLayer] = []
+    for i in range(num_layers):
+        p = f"L{i:02d}"
+        out += [
+            WorkloadLayer(f"{p}/QKV", "linear", B * S, d, 3 * d, dtype, sparsity),
+            WorkloadLayer(f"{p}/AttnScore", "attention", B * num_heads * S, hd, S, dtype, 0.0),
+            WorkloadLayer(f"{p}/AttnOut", "attention", B * num_heads * S, S, hd, dtype, 0.0),
+            WorkloadLayer(f"{p}/OutProj", "linear", B * S, d, d, dtype, sparsity),
+            WorkloadLayer(f"{p}/FFN1", "linear", B * S, d, ff, dtype, sparsity),
+            WorkloadLayer(f"{p}/FFN2", "linear", B * S, ff, d, dtype, sparsity),
+        ]
+    return out
+```
+
+### `uchu/orbit.py`
+
+```python
+"""Orbital environment: geometry (analytic eclipse), SEP-event schedule.
+
+v3 design: the environment is *stateless in time* except for a lazily generated
+flare schedule.  The simulator owns the single clock and queries exact
+interval quantities (eclipse segments, integrated flare intensity), so there is
+no per-layer ``advance_time`` drift.
+"""
+from __future__ import annotations
+
+import math
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from .config import OrbitalConfig, OrbitType, SolarActivity
+
+MU_EARTH = 3.986004418e14   # m^3 / s^2
+R_EARTH_KM = 6378.137
+
+# SEP-event (solar energetic particle) arrival rates, events / year   -- PLACEHOLDER
+SEP_EVENTS_PER_YEAR = {SolarActivity.LOW: 0.5, SolarActivity.MODERATE: 3.0, SolarActivity.HIGH: 8.0}
+SEP_MEAN_DURATION_S = 12 * 3600.0          # PLACEHOLDER
+SEP_INTENSITY_LOGSIGMA = 1.0               # lognormal sigma, median intensity 1.0 (PLACEHOLDER)
+
+
+def kepler_period_s(altitude_km: float) -> float:
+    a = (R_EARTH_KM + altitude_km) * 1e3
+    return 2.0 * math.pi * math.sqrt(a ** 3 / MU_EARTH)
+
+
+def eclipse_fraction(altitude_km: float, beta_deg: float = 0.0) -> float:
+    """Fraction of a circular orbit spent in Earth's cylindrical shadow."""
+    R, h = R_EARTH_KM, altitude_km
+    beta = math.radians(beta_deg)
+    arg = math.sqrt(h * h + 2.0 * R * h) / ((R + h) * math.cos(beta))
+    if arg >= 1.0:
+        return 0.0
+    return math.acos(arg) / math.pi
+
+
+class FlareSchedule:
+    """Poisson process of SEP events; each has (start, end, intensity).  Generated lazily and
+    sequentially from one RNG, so the schedule prefix is independent of query order."""
+
+    def __init__(self, rate_per_s: float, rng: Optional[np.random.Generator],
+                 mean_duration_s: float = SEP_MEAN_DURATION_S,
+                 log_sigma: float = SEP_INTENSITY_LOGSIGMA, median: float = 1.0):
+        self.rate = rate_per_s
+        self.median = median
+        self.rng = rng
+        self.mean_dur = mean_duration_s
+        self.log_sigma = log_sigma
+        self._cursor = 0.0
+        self._ev: List[Tuple[float, float, float]] = []
+        self._arr = (np.empty(0), np.empty(0), np.empty(0))
+        self._fixed = False
+
+    @classmethod
+    def from_events(cls, events: Sequence[Tuple[float, float, float]]) -> "FlareSchedule":
+        """Deterministic schedule for tests / replaying a real event list: (start_s, end_s, intensity)."""
+        s = cls(0.0, None)
+        s._ev = [tuple(map(float, e)) for e in events]
+        s._fixed = True
+        s._rebuild()
+        return s
+
+    def _rebuild(self):
+        if self._ev:
+            a = np.array(self._ev, float)
+            self._arr = (a[:, 0], a[:, 1], a[:, 2])
+        else:
+            self._arr = (np.empty(0), np.empty(0), np.empty(0))
+
+    def extend_to(self, t: float) -> None:
+        if self._fixed or self.rate <= 0.0:
+            return
+        grew = False
+        while self._cursor <= t:
+            self._cursor += float(self.rng.exponential(1.0 / self.rate))
+            dur = float(self.rng.exponential(self.mean_dur))
+            inten = float(self.rng.lognormal(math.log(self.median), self.log_sigma))
+            self._ev.append((self._cursor, self._cursor + dur, inten))
+            grew = True
+        if grew:
+            self._rebuild()
+
+    def intensity_integral(self, t0: float, t1: float) -> float:
+        """Exact integral of summed flare intensity over [t0, t1]  [intensity * s]."""
+        if t1 <= t0:
+            return 0.0
+        self.extend_to(t1)
+        s, e, i = self._arr
+        if s.size == 0:
+            return 0.0
+        overlap = np.clip(np.minimum(e, t1) - np.maximum(s, t0), 0.0, None)
+        return float(np.sum(i * overlap))
+
+    def intensity_at(self, t: float) -> float:
+        self.extend_to(t)
+        s, e, i = self._arr
+        if s.size == 0:
+            return 0.0
+        return float(np.sum(i[(s <= t) & (t < e)]))
+
+    @property
+    def events(self) -> List[Tuple[float, float, float]]:
+        return list(self._ev)
+
+
+class OrbitalEnvironment:
+    def __init__(self, cfg: OrbitalConfig, rng: Optional[np.random.Generator] = None):
+        self.cfg = cfg
+        if cfg.orbit_type == OrbitType.DEEP:
+            self.period_s = 1e12
+            self.eclipse_fraction = 0.0
+        else:
+            self.period_s = kepler_period_s(cfg.altitude_km)
+            self.eclipse_fraction = (cfg.eclipse_fraction_override
+                                     if cfg.eclipse_fraction_override is not None
+                                     else eclipse_fraction(cfg.altitude_km, cfg.beta_deg))
+        per_year = (cfg.sep_events_per_year if cfg.sep_events_per_year is not None
+                    else SEP_EVENTS_PER_YEAR[cfg.solar_activity])
+        self.flares = FlareSchedule(per_year / (365.25 * 86400.0),
+                                    rng if rng is not None else np.random.default_rng(0),
+                                    mean_duration_s=cfg.sep_mean_duration_s,
+                                    log_sigma=cfg.sep_intensity_log_sigma, median=cfg.sep_intensity_median)
+
+    # ---- geometry ---------------------------------------------------------
+    def in_eclipse(self, t: float) -> bool:
+        if self.eclipse_fraction <= 0.0:
+            return False
+        return (t % self.period_s) < self.eclipse_fraction * self.period_s
+
+    def eclipse_segments(self, t0: float, t1: float) -> List[Tuple[float, float, bool]]:
+        """Partition [t0, t1] into maximal (a, b, in_eclipse) segments, exactly."""
+        if t1 <= t0:
+            return []
+        if self.eclipse_fraction <= 0.0:
+            return [(t0, t1, False)]
+        P = self.period_s
+        ecl = self.eclipse_fraction * P
+        segs: List[Tuple[float, float, bool]] = []
+        t = t0
+        k = int(math.floor(t0 / P))
+        while t < t1:
+            start = k * P
+            ecl_end = start + ecl
+            nxt = start + P
+            if t < ecl_end:
+                b = min(ecl_end, t1)
+                segs.append((t, b, True))
+                t = b
+            if t < t1:
+                b = min(nxt, t1)
+                if b > t:
+                    segs.append((t, b, False))
+                    t = b
+            k += 1
+        return segs
+
+    # ---- SEP events ---------------------------------------------------------
+    def flare_intensity_integral(self, t0: float, t1: float) -> float:
+        return self.flares.intensity_integral(t0, t1)
+
+    def flare_intensity_at(self, t: float) -> float:
+        return self.flares.intensity_at(t)
+```
+
+### `uchu/thermal.py`
+
+```python
+"""Power, DVFS and the single lumped thermal model.
+
+v3 fixes vs v2
+  * ONE thermal model.  v2 integrated an ODE but then overwrote the state every
+    layer with a static ``250 + 0.8 P`` estimate.
+  * implicit (backward-Euler) integration with the leakage feedback solved
+    inside the step: unconditionally stable (v2 used forward Euler with C = 0.5 J/K).
+  * node leakage factor scales only STATIC power, area scales static power, MAC count scales
+    dynamic power (v2 multiplied total power by area x array^2 x leakage).
+  * clock/interconnect power also scale with V^2 (v2 omitted V).
+  * Earth IR + albedo loads added; radiator sized so default dissipation is feasible.
+  * runaway is detected and reported instead of silently clamped.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
+
+from .config import ProcessNode, SimConfig
+from .orbit import OrbitType
+
+SIGMA_SB = 5.670374419e-8
+T_MIN_K = 3.0
+T_SEARCH_MAX_K = 2500.0
+
+
+@dataclass(frozen=True)
+class DVFSState:
+    freq_ghz: float
+    voltage_v: float
+    throttled: bool
+
+
+class PowerModel:
+    """P = P_leak(T, V) + P_clock(f, V) + util * [P_logic + P_interconnect](f, V)."""
+
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        pw, comp = cfg.power, cfg.compute
+        self.pw, self.dv, self.node = pw, cfg.dvfs, comp.process_node
+        ref = ProcessNode[pw.ref_node]
+        area_ratio = comp.area_mm2 / pw.ref_area_mm2
+        self.array_ratio = (comp.array_size / pw.ref_array_size) ** 2
+        leak_rel = self.node.leakage_factor() / ref.leakage_factor()
+        cap_rel = self.node.cap_factor() / ref.cap_factor()
+        self.static_nom_w = pw.base_power_w * pw.static_frac * area_ratio * leak_rel
+        self.dynamic_nom_w = pw.base_power_w * (1.0 - pw.static_frac) * self.array_ratio * cap_rel
+        self.ic_scale = self.array_ratio ** pw.interconnect_extra_exponent
+
+    def breakdown(self, T: float, f_ghz: float, v: float, util: float = 1.0) -> dict:
+        pw = self.pw
+        fr = f_ghz / self.dv.nom_freq_ghz
+        vr = v / self.dv.nom_voltage_v
+        dyn = self.dynamic_nom_w * fr * vr ** 2
+        return {
+            "leakage": self.static_nom_w * math.exp(pw.leak_temp_coeff * (T - pw.T_nom_k) / pw.T_nom_k) * vr ** 3,
+            "clock": dyn * pw.clock_frac,
+            "interconnect": dyn * pw.interconnect_frac * self.ic_scale * util,
+            "logic": dyn * (1.0 - pw.clock_frac - pw.interconnect_frac) * util,
+        }
+
+    def power_w(self, T: float, f_ghz: float, v: float, util: float = 1.0) -> float:
+        return sum(self.breakdown(T, f_ghz, v, util).values())
+
+    def dvfs_state(self, T: float, f_target_ghz: Optional[float] = None) -> DVFSState:
+        dv = self.dv
+        f_t = dv.nom_freq_ghz if f_target_ghz is None else f_target_ghz
+        excess = max(0.0, T - dv.throttle_onset_k)
+        f = f_t * max(dv.throttle_floor, 1.0 - dv.throttle_slope_per_k * excess)
+        f = min(f, self.node.max_freq_ghz())
+        if dv.voltage_scaling:
+            v = dv.nom_voltage_v * math.sqrt(f / dv.nom_freq_ghz)
+            v = min(max(v, self.node.min_voltage()), self.node.max_voltage())
+        else:
+            v = dv.nom_voltage_v
+        return DVFSState(f, v, throttled=f < 0.99 * f_t)
+
+
+def _bracket(g: Callable[[float], float], T0: float, g0: float, direction: int
+             ) -> Optional[Tuple[float, float]]:
+    """Find [a, b] bracketing the nearest sign change of g from T0 in `direction` (doubling steps)."""
+    step = 0.05
+    a, ga = T0, g0
+    while True:
+        b = min(max(T0 + direction * step, T_MIN_K), T_SEARCH_MAX_K)
+        gb = g(b)
+        if ga == 0.0:
+            return (a, a)
+        if ga * gb <= 0.0:
+            return (a, b)
+        if b in (T_MIN_K, T_SEARCH_MAX_K):
+            return None
+        a, ga = b, gb
+        step *= 2.0
+
+
+class LumpedThermalModel:
+    def __init__(self, cfg: SimConfig):
+        self.tc = cfg.thermal
+        self.orbit_type = cfg.orbital.orbit_type
+        self.T = cfg.thermal.T_init_k
+        self.runaway = False
+
+    # ---- loads -----------------------------------------------------------
+    @property
+    def effective_view_factor(self) -> float:
+        tc = self.tc
+        return max(0.1, tc.view_factor * (1.0 - tc.degradation_per_year * tc.mission_year))
+
+    def radiated_w(self, T: float) -> float:
+        tc = self.tc
+        return tc.emissivity * SIGMA_SB * self.effective_view_factor * tc.radiator_area_m2 * T ** 4
+
+    def env_load_w(self, eclipse: bool) -> float:
+        tc = self.tc
+        A = tc.radiator_area_m2
+        if self.orbit_type == OrbitType.DEEP:
+            return tc.absorptance * tc.solar_flux_w_m2 * tc.sun_projected_fraction * A
+        ir = tc.emissivity * tc.earth_ir_w_m2 * tc.earth_view_fraction * A
+        if eclipse:
+            return ir
+        solar = tc.absorptance * tc.solar_flux_w_m2 * tc.sun_projected_fraction * A
+        alb = (tc.absorptance * tc.albedo * tc.solar_flux_w_m2 * tc.earth_view_fraction
+               * tc.albedo_geometry * A)
+        return ir + solar + alb
+
+    # ---- integration -------------------------------------------------------
+    def step(self, dt: float, power_fn: Callable[[float], float], eclipse: bool) -> float:
+        """Backward-Euler step of  C dT/dt = P(T) + Q_env - P_rad(T).  Returns the new temperature."""
+        if dt <= 0.0:
+            return self.T
+        C, T0, Q = self.tc.capacitance_j_per_k, self.T, self.env_load_w(eclipse)
+
+        def g(T: float) -> float:
+            return C * (T - T0) / dt - power_fn(T) - Q + self.radiated_w(T)
+
+        g0 = g(T0)
+        if g0 == 0.0:
+            return T0
+        br = _bracket(g, T0, g0, +1 if g0 < 0.0 else -1)
+        if br is None:
+            if g0 < 0.0:                 # heating with no root below the search ceiling: runaway
+                self.runaway = True
+                self.T = T_SEARCH_MAX_K
+            else:
+                self.T = T_MIN_K
+            return self.T
+        from scipy.optimize import brentq
+        a, b = br
+        self.T = a if a == b else brentq(g, min(a, b), max(a, b), xtol=1e-10, rtol=1e-13, maxiter=200)
+        return self.T
+
+    def steady_state(self, power_fn: Callable[[float], float], eclipse: bool) -> Optional[float]:
+        """Lowest (stable) equilibrium of P(T) + Q = P_rad(T); None if no equilibrium (runaway)."""
+        import numpy as np
+        from scipy.optimize import brentq
+        Q = self.env_load_w(eclipse)
+
+        def h(T: float) -> float:
+            return self.radiated_w(T) - power_fn(T) - Q
+
+        grid = np.geomspace(T_MIN_K, T_SEARCH_MAX_K, 800)
+        vals = [h(float(T)) for T in grid]
+        for i in range(len(grid) - 1):
+            if vals[i] <= 0.0 < vals[i + 1]:
+                return float(brentq(h, grid[i], grid[i + 1], xtol=1e-10))
+        return None
+```
+
+### `uchu/radiation.py`
+
+```python
+"""Radiation core (RHBD v4): cross-section x flux physics, word-level ECC, accumulation, scrubbing.
+
+Replaces the v2 model, in which
+  * rates were a single made-up per-bit constant times ad-hoc orbit multipliers,
+  * errors were injected into a 64-element array of zeros (rates independent of the workload),
+  * "SDC" was just the uncorrectable count,
+  * scrubbing declared every upset corrected (no accumulation => no double-bit errors),
+  * flare intensity was sampled but never used, and GCR rose with solar activity (it falls).
+
+Physics implemented here
+  rate/unit = integral sigma(x) * (-dPhi/dx) dx      (x = LET for ions, E for protons)
+  four environment components: GCR ions, trapped protons, SEP ions, SEP protons
+  SRAM: Poisson upsets -> MBU clusters on adjacent physical bits -> bit-interleaved SECDED words
+        -> persistent flipped-bit state until the next scrub -> {corrected, DUE, SDC-candidate}
+  registers / logic (SET): derated by capture probability, AVF and optional TMR
+  SEL: Poisson events -> power-cycle downtime (protected) or destruction (unprotected)
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+import numpy as np
+
+from .config import RadiationConfig, SimConfig, SolarActivity
+from .config import OrbitType
+from .orbit import OrbitalEnvironment
+from .stats import poisson_rate_ci
+
+# ---------------------------------------------------------------------------
+# Spectra and the cross-section integral
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TruncatedPowerLaw:
+    """Integral flux Phi(>x) = phi_ref [ (x/x_ref)^-g - (x_max/x_ref)^-g ]  for x < x_max, else 0."""
+    phi_ref: float
+    x_ref: float
+    gamma: float
+    x_max: float
+
+    def integral(self, x):
+        x = np.asarray(x, dtype=float)
+        v = self.phi_ref * (np.power(np.maximum(x, 1e-300) / self.x_ref, -self.gamma)
+                            - (self.x_max / self.x_ref) ** (-self.gamma))
+        return np.where(x < self.x_max, v, 0.0)
+
+    def differential(self, x):
+        x = np.asarray(x, dtype=float)
+        d = self.gamma * self.phi_ref / self.x_ref * np.power(np.maximum(x, 1e-300) / self.x_ref,
+                                                                 -self.gamma - 1.0)
+        return np.where(x < self.x_max, d, 0.0)
+
+
+class TabulatedSpectrum:
+    """Integral flux from a CREME96/OMERE/SPENVIS export: arrays x (ascending) and Phi(>x)."""
+
+    def __init__(self, x, phi_integral):
+        self.x = np.asarray(x, float)
+        self.phi = np.asarray(phi_integral, float)
+        if np.any(np.diff(self.x) <= 0) or np.any(np.diff(self.phi) > 0):
+            raise ValueError("x must be ascending and Phi(>x) non-increasing")
+        self.x_max = float(self.x[-1])
+
+    def integral(self, x):
+        x = np.asarray(x, float)
+        lx, lp = np.log(self.x), np.log(np.maximum(self.phi, 1e-300))
+        out = np.exp(np.interp(np.log(np.maximum(x, 1e-300)), lx, lp))
+        out = np.where(x < self.x[0], self.phi[0], out)
+        return np.where(x < self.x_max, out, 0.0)
+
+
+def integral_rate(sigma, spectrum, x_lo: float, x_hi: Optional[float] = None,
+                  n: int = 4000, extra_nodes=()) -> float:
+    """sum_bins sigma(x_mid) * [Phi(x_i) - Phi(x_{i+1})]   (units of sigma x flux: events / unit / s).
+
+    Flux mass per bin is exact (differences of the integral flux); only sigma is sampled.
+    Adding ``extra_nodes`` (e.g. a threshold) makes step cross-sections exact.
+    """
+    x_hi = float(spectrum.x_max if x_hi is None else x_hi)
+    grid = np.geomspace(x_lo, x_hi, n + 1)
+    if len(extra_nodes):
+        ex = np.asarray([e for e in extra_nodes if x_lo < e < x_hi], float)
+        grid = np.unique(np.concatenate([grid, ex]))
+    dphi = spectrum.integral(grid[:-1]) - spectrum.integral(grid[1:])
+    mid = np.sqrt(grid[:-1] * grid[1:])
+    return float(np.sum(sigma(mid) * dphi))
+
+
+# ---------------------------------------------------------------------------
+# Orbit / shielding scalings (PLACEHOLDERS -- replace with CREME96 / AP-9 derived tables)
+# ---------------------------------------------------------------------------
+_SOLAR_GCR_MOD = {SolarActivity.LOW: 1.0, SolarActivity.MODERATE: 0.7, SolarActivity.HIGH: 0.45}
+_TRAPPED_ALT_KM = np.array([200., 400., 600., 800., 1000., 1500., 2000.])
+_TRAPPED_FACTOR = np.array([0.05, 0.4, 1.0, 3.0, 8.0, 40.0, 60.0])   # 1.0 == reference spectrum
+
+
+def geomagnetic_transmission(orbit_type: OrbitType, inclination_deg: float) -> float:
+    if orbit_type == OrbitType.LEO:
+        return 0.05 + 0.95 * abs(math.sin(math.radians(inclination_deg))) ** 3
+    if orbit_type == OrbitType.MEO:
+        return 0.9
+    return 1.0
+
+
+def trapped_proton_factor(orbit_type: OrbitType, altitude_km: float) -> float:
+    if orbit_type == OrbitType.LEO:
+        return float(np.exp(np.interp(altitude_km, _TRAPPED_ALT_KM, np.log(_TRAPPED_FACTOR))))
+    if orbit_type == OrbitType.MEO:
+        return 300.0
+    return 0.0          # GEO / deep space: no significant trapped-proton population
+
+
+class RadiationEnvironment:
+    """Time-dependent expected upset counts for each region, from cross-section x flux integrals."""
+
+    REGIONS = ("sram", "register", "logic_set", "sel")
+
+    def __init__(self, cfg: SimConfig, orbit: OrbitalEnvironment):
+        rc: RadiationConfig = cfg.radiation
+        self.orbit = orbit
+        o = cfg.orbital
+        tabulated = rc.environment_mode == "tabulated_orbit"
+        if tabulated:        # orbit-specific, already-shielded tables: no placeholder scalings
+            geo = solar = trapped = p_shield = 1.0
+        else:
+            geo = geomagnetic_transmission(o.orbit_type, o.inclination_deg)
+            solar = _SOLAR_GCR_MOD[o.solar_activity]
+            trapped = trapped_proton_factor(o.orbit_type, o.altitude_km)
+            p_shield = math.exp(-rc.shield_mm_al / rc.shield_atten_len_mm)
+        self.scalars = {"geo": geo, "solar_gcr": solar, "trapped": trapped, "proton_shield": p_shield}
+
+        spec = {}
+        for k in ("gcr_ion", "trapped_proton", "sep_ion", "sep_proton"):
+            if k in rc.tables:
+                spec[k] = TabulatedSpectrum(rc.tables[k].x, rc.tables[k].phi_integral)
+            elif tabulated:
+                spec[k] = None                      # component absent from the orbit-specific tables => zero flux
+            else:
+                spec[k] = TruncatedPowerLaw(**vars(getattr(rc, k)))
+
+        def _rate(cs, key, lo):
+            return 0.0 if spec[key] is None else integral_rate(cs, spec[key], lo, extra_nodes=[cs.x_th])
+
+        self.base: Dict[str, Dict[str, float]] = {}
+        self.static_rate: Dict[str, float] = {}     # events / unit / s outside SEP events
+        self.sep_coeff: Dict[str, float] = {}       # events / unit / (intensity * s)
+        for name in self.REGIONS:
+            xs = getattr(rc, name)
+            comp = {
+                "gcr": _rate(xs.ion, "gcr_ion", rc.let_grid_lo),
+                "trapped": _rate(xs.proton, "trapped_proton", rc.energy_grid_lo),
+                "sep_ion": _rate(xs.ion, "sep_ion", rc.let_grid_lo),
+                "sep_p": _rate(xs.proton, "sep_proton", rc.energy_grid_lo),
+            }
+            self.base[name] = comp
+            self.static_rate[name] = comp["gcr"] * geo * solar + comp["trapped"] * trapped * p_shield
+            self.sep_coeff[name] = (comp["sep_ion"] + comp["sep_p"] * p_shield) * geo
+
+    def rate_per_unit_s(self, region: str, t: float) -> float:
+        return self.static_rate[region] + self.sep_coeff[region] * self.orbit.flare_intensity_at(t)
+
+    def expected(self, region: str, n_units: float, t0: float, t1: float) -> float:
+        """Expected event count for n_units (bits / gates / devices) over [t0, t1], exact in the flare term."""
+        if t1 <= t0 or n_units <= 0:
+            return 0.0
+        return float(n_units) * (self.static_rate[region] * (t1 - t0)
+                                 + self.sep_coeff[region] * self.orbit.flare_intensity_integral(t0, t1))
+
+
+# ---------------------------------------------------------------------------
+# ECC memory with persistent flipped-bit state
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ScrubResult:
+    corrected_words: int = 0
+    due_words: int = 0
+    sdc_words: int = 0
+
+
+class EccMemory:
+    """Sparse flipped-bit set + bit-interleaved SECDED word mapping.
+
+    Physical layout: a row holds ``interleave`` words of ``word_bits`` bits, column-interleaved,
+    so physical column c belongs to word (c mod interleave).  Adjacent physical bits therefore land
+    in different logical words, which is exactly why interleaving defeats multi-bit upsets <= interleave.
+    """
+
+    def __init__(self, word_bits: int = 64, interleave: int = 4, ecc: bool = True,
+                 odd_miscorrect_prob: float = 1.0):
+        self.W, self.I, self.ecc = int(word_bits), int(interleave), bool(ecc)
+        self.p_mis = float(odd_miscorrect_prob)
+        self.state = np.empty(0, dtype=np.int64)
+
+    def word_of(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype=np.int64)
+        row = bits // (self.I * self.W)
+        col = bits % (self.I * self.W)
+        return row * self.I + (col % self.I)
+
+    def inject(self, positions) -> None:
+        """XOR-toggle bits: a bit hit twice returns to its correct value."""
+        pos = np.asarray(positions, dtype=np.int64).ravel()
+        if pos.size == 0:
+            return
+        allp = np.concatenate([self.state, pos])
+        u, c = np.unique(allp, return_counts=True)
+        self.state = u[(c % 2) == 1]
+
+    @property
+    def n_flipped(self) -> int:
+        return int(self.state.size)
+
+    def clear(self) -> None:
+        self.state = np.empty(0, dtype=np.int64)
+
+    def scrub(self, rng: Optional[np.random.Generator] = None) -> ScrubResult:
+        if self.state.size == 0:
+            return ScrubResult()
+        _, counts = np.unique(self.word_of(self.state), return_counts=True)
+        self.clear()
+        if not self.ecc:
+            return ScrubResult(0, 0, int(counts.size))       # every corrupted word is silently wrong
+        corrected = int(np.sum(counts == 1))
+        odd_multi = int(np.sum((counts >= 3) & (counts % 2 == 1)))
+        even_multi = int(np.sum((counts >= 2) & (counts % 2 == 0)))
+        if odd_multi:
+            rng = rng or np.random.default_rng(0)
+            sdc = int(rng.binomial(odd_multi, self.p_mis))
+        else:
+            sdc = 0
+        due = (even_multi) + (odd_multi - sdc)
+        return ScrubResult(corrected, due, sdc)
+
+
+# ---------------------------------------------------------------------------
+# Ledger and immutable statistics
+# ---------------------------------------------------------------------------
+@dataclass
+class RadiationLedger:
+    n_seu_sram: int = 0
+    n_mbu: int = 0
+    n_seu_reg: int = 0
+    n_set_hits: int = 0
+    n_set_latched: int = 0
+    n_sel: int = 0
+    words_corrected: int = 0
+    words_due: int = 0
+    sdc_sram_candidates: int = 0
+    sdc_sram: int = 0
+    sdc_register: int = 0
+    sdc_logic: int = 0
+    downtime_s: float = 0.0
+    destroyed: bool = False
+    destroyed_at_s: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class RadiationStats:
+    elapsed_s: float
+    n_seu_sram: int
+    n_mbu: int
+    n_seu_reg: int
+    n_set_hits: int
+    n_set_latched: int
+    n_sel: int
+    words_corrected: int
+    words_due: int
+    sdc_sram_candidates: int
+    sdc_sram: int
+    sdc_register: int
+    sdc_logic: int
+    downtime_s: float
+    destroyed: bool
+
+    @property
+    def sdc_total(self) -> int:
+        return self.sdc_sram + self.sdc_register + self.sdc_logic
+
+    @property
+    def _hours(self) -> float:
+        return self.elapsed_s / 3600.0
+
+    @property
+    def sdc_per_hr(self) -> float:
+        return self.sdc_total / self._hours if self._hours > 0 else 0.0
+
+    @property
+    def due_per_hr(self) -> float:
+        return self.words_due / self._hours if self._hours > 0 else 0.0
+
+    def sdc_per_hr_ci(self, conf: float = 0.95):
+        return poisson_rate_ci(self.sdc_total, self._hours, conf)
+
+    @property
+    def fit_sdc(self) -> float:
+        """Failures-in-time: SDC events per 1e9 device-hours."""
+        return self.sdc_per_hr * 1e9
+
+    @property
+    def availability(self) -> float:
+        return 1.0 - min(1.0, self.downtime_s / self.elapsed_s) if self.elapsed_s > 0 else 1.0
+
+    def p_no_sdc(self, mission_hours: float) -> float:
+        """P(no SDC during mission_hours) under a constant-rate Poisson model (point estimate)."""
+        return math.exp(-self.sdc_per_hr * mission_hours)
+
+    def p_no_sdc_ci(self, mission_hours: float, conf: float = 0.95):
+        lo, hi = self.sdc_per_hr_ci(conf)
+        return math.exp(-hi * mission_hours), math.exp(-lo * mission_hours)
+
+
+# ---------------------------------------------------------------------------
+# The subsystem that exposes the chip to the environment
+# ---------------------------------------------------------------------------
+class RadiationSubsystem:
+    """Needs only ``env.expected(region, n, t0, t1)``, so tests can inject a stub environment."""
+
+    def __init__(self, cfg: SimConfig, env, rng: np.random.Generator):
+        self.cfg, self.rc, self.env, self.rng = cfg, cfg.radiation, env, rng
+        rc = self.rc
+        A = cfg.compute.array_size
+        self.sram_bits_total = int(cfg.memory.onchip_sram_mb * 2**20 * 8)
+        self.reg_bits = A * A * rc.reg_bits_per_pe
+        self.gates = A * A * rc.gates_per_pe
+        self.mem = EccMemory(rc.ecc_word_bits, rc.ecc_interleave, cfg.memory.ecc_enabled,
+                             rc.secded_odd_miscorrect_prob)
+        self.ledger = RadiationLedger()
+        self._tmr = rc.tmr_residual if rc.tmr_enabled else 1.0
+
+    # ---- helpers -------------------------------------------------------
+    def _cluster_sizes(self, n: int) -> np.ndarray:
+        m = self.rc.mbu_max_cluster
+        return 2 + np.minimum(self.rng.geometric(self.rc.mbu_cluster_geom_p, size=n) - 1, m - 2)
+
+    def _binom(self, n: int, p: float) -> int:
+        return int(self.rng.binomial(n, min(1.0, max(0.0, p)))) if n > 0 else 0
+
+    # ---- exposure ----------------------------------------------------------
+    def expose(self, t0: float, t1: float, live_sram_bits: float, freq_ghz: float) -> None:
+        if t1 <= t0 or self.ledger.destroyed:
+            return
+        rc, led, rng = self.rc, self.ledger, self.rng
+        live = int(max(1, min(live_sram_bits, self.sram_bits_total)))
+
+        # SRAM: primary hits -> MBU clusters -> persistent flipped state
+        n = int(rng.poisson(self.env.expected("sram", live, t0, t1)))
+        if n:
+            led.n_seu_sram += n
+            prim = rng.integers(0, live, size=n)
+            is_mbu = rng.random(n) < rc.mbu_prob
+            n_mbu = int(is_mbu.sum())
+            led.n_mbu += n_mbu
+            pos = [prim]
+            if n_mbu:
+                reps = self._cluster_sizes(n_mbu) - 1
+                owner = np.repeat(np.arange(n_mbu), reps)
+                within = np.arange(int(reps.sum())) - np.repeat(np.cumsum(reps) - reps, reps) + 1
+                pos.append(np.minimum(prim[is_mbu][owner] + within, self.sram_bits_total - 1))
+            self.mem.inject(np.concatenate(pos))
+
+        # registers: raw flip-flop upsets, derated by AVF (and TMR)
+        n = int(rng.poisson(self.env.expected("register", self.reg_bits, t0, t1)))
+        if n:
+            led.n_seu_reg += n
+            led.sdc_register += self._binom(n, rc.avf_register * self._tmr)
+
+        # SET in combinational logic: must be latched (pulse width x clock), then not masked
+        hits = int(rng.poisson(self.env.expected("logic_set", self.gates, t0, t1)))
+        if hits:
+            led.n_set_hits += hits
+            p_cap = min(1.0, rc.set_pulse_width_ps * 1e-12 * freq_ghz * 1e9)
+            latched = self._binom(hits, p_cap)
+            led.n_set_latched += latched
+            led.sdc_logic += self._binom(latched, rc.avf_logic * self._tmr)
+
+        # SEL: one device
+        n = int(rng.poisson(self.env.expected("sel", 1, t0, t1)))
+        if n:
+            led.n_sel += n
+            if rc.sel_protected:
+                led.downtime_s += n * rc.sel_recovery_s
+                self.mem.clear()                    # power cycle reloads state
+            elif rng.random() < 1.0 - (1.0 - rc.sel_destructive_prob_unprotected) ** n:
+                led.destroyed, led.destroyed_at_s = True, t1
+
+    def scrub(self) -> ScrubResult:
+        res = self.mem.scrub(self.rng)
+        led = self.ledger
+        led.words_corrected += res.corrected_words
+        led.words_due += res.due_words
+        led.sdc_sram_candidates += res.sdc_words
+        led.sdc_sram += self._binom(res.sdc_words, self.rc.avf_sram)
+        return res
+
+    def stats(self, elapsed_s: float) -> RadiationStats:
+        l = self.ledger
+        return RadiationStats(
+            elapsed_s=elapsed_s, n_seu_sram=l.n_seu_sram, n_mbu=l.n_mbu, n_seu_reg=l.n_seu_reg,
+            n_set_hits=l.n_set_hits, n_set_latched=l.n_set_latched, n_sel=l.n_sel,
+            words_corrected=l.words_corrected, words_due=l.words_due,
+            sdc_sram_candidates=l.sdc_sram_candidates, sdc_sram=l.sdc_sram,
+            sdc_register=l.sdc_register, sdc_logic=l.sdc_logic,
+            downtime_s=l.downtime_s, destroyed=l.destroyed)
+```
+
+### `uchu/faults.py`
+
+```python
+"""Real bit flips on real tensors, and measured architectural vulnerability (AVF).
+
+v2 injected additive noise into a 64-element array of zeros.  Here a single bit of a
+real operand is flipped (two's-complement / IEEE-754 aware) and the GEMM output is compared
+with the fault-free output, so derating factors come from measurement, not guesswork.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+
+from .rng import make_rng
+from .stats import wilson_ci
+
+_UINT = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}
+
+
+def flip_bit(arr: np.ndarray, flat_index: int, bit: int) -> np.ndarray:
+    """Return a copy of ``arr`` with bit ``bit`` (0 = LSB) of element ``flat_index`` flipped."""
+    out = np.ascontiguousarray(arr).copy()
+    nbits = out.dtype.itemsize * 8
+    if not 0 <= bit < nbits:
+        raise ValueError(f"bit {bit} out of range for {out.dtype} ({nbits} bits)")
+    view = out.reshape(-1).view(_UINT[out.dtype.itemsize])
+    view[flat_index] ^= _UINT[out.dtype.itemsize](1 << bit)
+    return out
+
+
+def _gemm(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    with np.errstate(all="ignore"):          # flipped exponents legitimately produce inf / NaN
+        if np.issubdtype(a.dtype, np.integer):
+            return a.astype(np.int64) @ b.astype(np.int64)
+        return a.astype(np.float64) @ b.astype(np.float64)
+
+
+def _random_operand(rng, shape, dtype) -> np.ndarray:
+    dt = np.dtype(dtype)
+    if np.issubdtype(dt, np.integer):
+        info = np.iinfo(dt)
+        return rng.integers(info.min, info.max + 1, size=shape).astype(dt)
+    return rng.standard_normal(shape).astype(dt)
+
+
+@dataclass(frozen=True)
+class VulnerabilityResult:
+    avf: float
+    ci_low: float
+    ci_high: float
+    per_bit_avf: Tuple[float, ...]   # index = bit position, 0 = LSB
+    n_trials: int
+    tol: float
+
+
+def measure_gemm_vulnerability(M: int = 32, K: int = 32, N: int = 32, dtype="int8", tol: float = 1e-2,
+                               trials_per_bit: int = 100, seed: int = 0) -> VulnerabilityResult:
+    """P(single-bit operand flip changes the GEMM output by more than ``tol`` relative L2 error).
+
+    Bit positions are weighted uniformly (every stored bit is equally likely to be hit);
+    A and B are hit in proportion to their size.  Non-finite outputs count as vulnerable.
+    """
+    rng = make_rng(seed, "avf", str(dtype), M, K, N)
+    dt = np.dtype(dtype)
+    nbits = dt.itemsize * 8
+    A, B = _random_operand(rng, (M, K), dt), _random_operand(rng, (K, N), dt)
+    C = _gemm(A, B)
+    nc = float(np.linalg.norm(C.astype(np.float64)))
+    p_a = (M * K) / (M * K + K * N)
+    per_bit, hits, total = [], 0, 0
+    for bit in range(nbits):
+        h = 0
+        for _ in range(trials_per_bit):
+            if rng.random() < p_a:
+                idx = int(rng.integers(0, M * K))
+                C2 = _gemm(flip_bit(A, idx, bit), B)
+            else:
+                idx = int(rng.integers(0, K * N))
+                C2 = _gemm(A, flip_bit(B, idx, bit))
+            d = C2.astype(np.float64) - C.astype(np.float64)
+            err = float(np.linalg.norm(d)) / max(nc, 1e-300) if np.all(np.isfinite(d)) else np.inf
+            h += err > tol
+        per_bit.append(h / trials_per_bit)
+        hits += h
+        total += trials_per_bit
+    lo, hi = wilson_ci(hits, total)
+    return VulnerabilityResult(hits / total, lo, hi, tuple(per_bit), total, tol)
+```
+
+### `uchu/provenance.py`
+
+```python
+"""Run provenance: everything needed to reproduce a result."""
+from __future__ import annotations
+
+import platform
+import subprocess
+import sys
+from typing import Optional
+
+import numpy as np
+import scipy
+
+from .config import SimConfig
+
+MODEL_VERSION = "3.0.0"
+
+
+def git_hash() -> Optional[str]:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+    except Exception:
+        return None
+
+
+def provenance(cfg: SimConfig, seed: Optional[int] = None) -> dict:
+    return {
+        "model_version": MODEL_VERSION,
+        "config_hash": cfg.config_hash(),
+        "seed": cfg.random_seed if seed is None else seed,
+        "python": sys.version.split()[0],
+        "numpy": np.__version__,
+        "scipy": scipy.__version__,
+        "platform": platform.platform(),
+        "git": git_hash(),
+    }
+```
+
+### `uchu/simulator.py`
+
+```python
+"""Single-clock simulator: thermal + orbit + radiation advance together, exactly.
+
+v3 fixes vs v2
+  * ONE authoritative clock (``ChipSimulator.t``); thermal, eclipse, flares, scrubbing and
+    radiation exposure all use the *actual* elapsed time of each step (v2 advanced orbit by a
+    nominal-frequency estimate while layers ran at throttled speed).
+  * run_mission() reaches orbit-scale time (eclipse cycles, flares) with macro-steps; v2 simulated
+    ~10 s and Monte-Carlo used a single iteration, so it never saw an eclipse or a flare.
+  * no global RNG: every stream comes from ``rng.make_rng(seed, key...)``.
+  * ensemble members are independent processes with spawned seeds (v2: threads + global seeding).
+"""
+from __future__ import annotations
+
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+
+from .config import SimConfig, SolarActivity
+from .memory import PassProfile, WorkloadLayer, profile_pass
+from .orbit import OrbitalEnvironment
+from .provenance import provenance
+from .radiation import RadiationEnvironment, RadiationStats, RadiationSubsystem
+from .rng import child_seed, make_rng
+from .stats import poisson_rate_ci
+from .thermal import DVFSState, LumpedThermalModel, PowerModel
+
+
+class ChipSimulator:
+    def __init__(self, cfg: SimConfig, seed: Optional[int] = None):
+        self.cfg = cfg.validate()
+        self.seed = cfg.random_seed if seed is None else int(seed)
+        self.orbit = OrbitalEnvironment(cfg.orbital, make_rng(self.seed, "orbit"))
+        self.power = PowerModel(cfg)
+        self.thermal = LumpedThermalModel(cfg)
+        self.env = RadiationEnvironment(cfg, self.orbit)
+        self.rad = RadiationSubsystem(cfg, self.env, make_rng(self.seed, "radiation"))
+        self.t = 0.0
+        self.energy_j = 0.0
+        self.overtemp_s = 0.0
+        self.throttled_s = 0.0
+        self.failed = False
+        self.fail_reason: Optional[str] = None
+        self._next_scrub = cfg.radiation.scrub_interval_s
+
+    def dvfs(self) -> DVFSState:
+        return self.power.dvfs_state(self.thermal.T)
+
+    def advance(self, dt: float, util: float, live_sram_bits: float, state: DVFSState) -> None:
+        """Advance the whole chip by ``dt`` seconds at fixed (f, V, util)."""
+        cfg, rc = self.cfg, self.cfg.radiation
+        t_end = self.t + dt
+        while self.t < t_end - 1e-12 and not self.failed:
+            a, b, ecl = self.orbit.eclipse_segments(self.t, t_end)[0]
+            seg_end = min(b, self._next_scrub, self.t + cfg.thermal.max_substep_s, t_end)
+            h = seg_end - self.t
+            T_new = self.thermal.step(
+                h, lambda T: self.power.power_w(T, state.freq_ghz, state.voltage_v, util), ecl)
+            p_end = self.power.power_w(T_new, state.freq_ghz, state.voltage_v, util)
+            self.energy_j += p_end * h            # end-point rule == backward-Euler energy balance
+            if T_new > cfg.power.T_max_k:
+                self.overtemp_s += h
+            if state.throttled:
+                self.throttled_s += h
+            if self.thermal.runaway:
+                self.failed, self.fail_reason = True, "thermal_runaway"
+            self.rad.expose(self.t, seg_end, live_sram_bits, state.freq_ghz)
+            if self.rad.ledger.destroyed:
+                self.failed, self.fail_reason = True, "single_event_latchup_destructive"
+            self.t = seg_end
+            if self.t >= self._next_scrub - 1e-12:
+                self.rad.scrub()
+                self._next_scrub += rc.scrub_interval_s
+
+    def finalize(self) -> RadiationStats:
+        """Classify any still-unscrubbed flipped bits (treated as read at end of run)."""
+        self.rad.scrub()
+        return self.rad.stats(self.t)
+
+
+# ---------------------------------------------------------------------------
+# Short workload run (pass-level stepping, single clock)
+# ---------------------------------------------------------------------------
+@dataclass
+class WorkloadResult:
+    elapsed_s: float
+    n_passes: int
+    dense_flops: float
+    executed_flops: float
+    avg_tflops_dense: float
+    avg_power_w: float
+    energy_j: float
+    peak_temperature_k: float
+    final_temperature_k: float
+    memory_bound_fraction: float
+    radiation: RadiationStats
+    failed: bool
+    fail_reason: Optional[str]
+    first_pass_layers: list
+    provenance: dict = field(default_factory=dict)
+
+    @property
+    def tflops_per_watt(self) -> float:
+        return self.avg_tflops_dense / self.avg_power_w if self.avg_power_w > 0 else 0.0
+
+
+def run_workload(cfg: SimConfig, layers: Sequence[WorkloadLayer], n_passes: int = 100,
+                 seed: Optional[int] = None) -> WorkloadResult:
+    sim = ChipSimulator(cfg, seed)
+    layers = list(layers)
+    dense = execd = mb_time = 0.0
+    peakT = sim.thermal.T
+    first = None
+    done = 0
+    for _ in range(n_passes):
+        state = sim.dvfs()
+        prof = profile_pass(layers, cfg, state.freq_ghz)
+        first = first or prof.layers
+        sim.advance(prof.duration_s, prof.util, prof.live_sram_bits, state)
+        dense += prof.dense_flops
+        execd += prof.executed_flops
+        mb_time += prof.memory_bound_fraction * prof.duration_s
+        peakT = max(peakT, sim.thermal.T)
+        done += 1
+        if sim.failed:
+            break
+    rad = sim.finalize()
+    el = max(sim.t, 1e-300)
+    return WorkloadResult(
+        elapsed_s=sim.t, n_passes=done, dense_flops=dense, executed_flops=execd,
+        avg_tflops_dense=dense / el / 1e12, avg_power_w=sim.energy_j / el, energy_j=sim.energy_j,
+        peak_temperature_k=peakT, final_temperature_k=sim.thermal.T,
+        memory_bound_fraction=mb_time / el, radiation=rad, failed=sim.failed,
+        fail_reason=sim.fail_reason, first_pass_layers=list(first or []),
+        provenance=provenance(cfg, sim.seed))
+
+
+# ---------------------------------------------------------------------------
+# Mission run (macro-steps; reaches eclipse cycles and SEP events)
+# ---------------------------------------------------------------------------
+@dataclass
+class MissionResult:
+    mission_s: float
+    simulated_s: float
+    completed: bool
+    failed: bool
+    fail_reason: Optional[str]
+    dense_flops: float
+    avg_tflops_dense: float
+    avg_power_w: float
+    energy_j: float
+    T_min_k: float
+    T_max_k: float
+    T_mean_k: float
+    overtemp_s: float
+    throttled_fraction: float
+    radiation: RadiationStats
+    availability: float
+    flare_events: list
+    series: Dict[str, np.ndarray]
+    provenance: dict = field(default_factory=dict)
+
+
+def run_mission(cfg: SimConfig, layers: Sequence[WorkloadLayer], mission_s: float, duty: float = 1.0,
+                dt_max_s: float = 10.0, seed: Optional[int] = None,
+                record_every_s: float = 60.0) -> MissionResult:
+    if not 0.0 <= duty <= 1.0:
+        raise ValueError("duty must be in [0, 1]")
+    sim = ChipSimulator(cfg, seed)
+    layers = list(layers)
+    cache: Dict[float, PassProfile] = {}
+    flops = 0.0
+    sumT = Tmin = Tmax = None
+    sumT = 0.0
+    Tmin, Tmax = sim.thermal.T, sim.thermal.T
+    rec = {"t": [], "T": [], "f": [], "eclipse": [], "flare": []}
+    next_rec = 0.0
+    while sim.t < mission_s - 1e-9 and not sim.failed:
+        state = sim.dvfs()
+        key = round(state.freq_ghz, 4)
+        if key not in cache:
+            cache[key] = profile_pass(layers, cfg, key)
+        prof = cache[key]
+        dt = min(dt_max_s, mission_s - sim.t)
+        t0 = sim.t
+        sim.advance(dt, duty * prof.util, prof.live_sram_bits, state)
+        h = sim.t - t0
+        flops += duty * h * prof.dense_flops / prof.duration_s
+        T = sim.thermal.T
+        sumT += T * h
+        Tmin, Tmax = min(Tmin, T), max(Tmax, T)
+        if t0 >= next_rec:
+            rec["t"].append(t0); rec["T"].append(T); rec["f"].append(state.freq_ghz)
+            rec["eclipse"].append(sim.orbit.in_eclipse(t0)); rec["flare"].append(sim.orbit.flare_intensity_at(t0))
+            next_rec += record_every_s
+    rad = sim.finalize()
+    el = max(sim.t, 1e-300)
+    avail = rad.availability
+    flops *= avail
+    return MissionResult(
+        mission_s=mission_s, simulated_s=sim.t, completed=sim.t >= mission_s - 1e-6 and not sim.failed,
+        failed=sim.failed, fail_reason=sim.fail_reason, dense_flops=flops,
+        avg_tflops_dense=flops / el / 1e12, avg_power_w=sim.energy_j / el, energy_j=sim.energy_j,
+        T_min_k=Tmin, T_max_k=Tmax, T_mean_k=sumT / el, overtemp_s=sim.overtemp_s,
+        throttled_fraction=sim.throttled_s / el, radiation=rad, availability=avail,
+        flare_events=sim.orbit.flares.events, series={k: np.asarray(v) for k, v in rec.items()},
+        provenance=provenance(cfg, sim.seed))
+
+
+# ---------------------------------------------------------------------------
+# Ensemble (independent processes, spawned seeds, pooled exact Poisson statistics)
+# ---------------------------------------------------------------------------
+@dataclass
+class EnsembleResult:
+    n_samples: int
+    total_hours: float
+    total_sdc: int
+    total_due: int
+    sdc_per_hr: float
+    sdc_per_hr_ci: tuple
+    due_per_hr: float
+    per_sample_sdc_per_hr: np.ndarray
+    n_failed: int
+    mean_availability: float
+    provenance: dict
+
+
+def _ensemble_worker(args):
+    cfg, layers, mission_s, duty, dt_max_s, seed, activity = args
+    cfg = cfg.copy()
+    if activity is not None:
+        cfg.orbital.solar_activity = activity
+    r = run_mission(cfg, layers, mission_s, duty, dt_max_s, seed)
+    return (r.radiation.sdc_total, r.radiation.words_due, r.simulated_s, r.failed, r.availability)
+
+
+def run_ensemble(cfg: SimConfig, layers: Sequence[WorkloadLayer], n_samples: int, mission_s: float,
+                 duty: float = 1.0, dt_max_s: float = 10.0, n_jobs: int = 1,
+                 base_seed: Optional[int] = None,
+                 solar_weights: Optional[Dict[SolarActivity, float]] = None) -> EnsembleResult:
+    base = cfg.random_seed if base_seed is None else int(base_seed)
+    acts: List[Optional[SolarActivity]] = [None] * n_samples
+    if solar_weights:
+        keys = list(solar_weights)
+        w = np.array([solar_weights[k] for k in keys], float)
+        w /= w.sum()
+        for i in range(n_samples):
+            acts[i] = keys[int(make_rng(base, "scenario", i).choice(len(keys), p=w))]
+    jobs = [(cfg, list(layers), mission_s, duty, dt_max_s, child_seed(base, "sample", i), acts[i])
+            for i in range(n_samples)]
+    if n_jobs == 1:
+        out = [_ensemble_worker(j) for j in jobs]
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            out = list(ex.map(_ensemble_worker, jobs))
+    sdc = np.array([o[0] for o in out]); due = np.array([o[1] for o in out])
+    el = np.array([o[2] for o in out]) / 3600.0
+    hours = float(el.sum())
+    ci = poisson_rate_ci(int(sdc.sum()), hours)
+    return EnsembleResult(
+        n_samples=n_samples, total_hours=hours, total_sdc=int(sdc.sum()), total_due=int(due.sum()),
+        sdc_per_hr=float(sdc.sum() / hours) if hours > 0 else 0.0, sdc_per_hr_ci=ci,
+        due_per_hr=float(due.sum() / hours) if hours > 0 else 0.0,
+        per_sample_sdc_per_hr=sdc / np.maximum(el, 1e-300), n_failed=int(sum(o[3] for o in out)),
+        mean_availability=float(np.mean([o[4] for o in out])), provenance=provenance(cfg, base))
+```
+
+### Calibration package
+
+### `uchu/calibration/__init__.py`
+
+```python
+"""Calibration workflow for the placeholder parameters of Uchu Gijutsu v3."""
+from .data import (BeamDataset, BeamPoint, CalibrationData, CalibrationDataError, FlightLog, MbuDataset, PerfMeasurement,
+                   PowerMeasurement, SepCatalog, ThermalSample, effective_let, load_beam_csv, load_mbu_csv,
+                   load_perf_csv, load_power_csv, load_sep_csv, load_spectrum_csv, load_thermal_csv)
+from .fit_hardware import (design_coverage, fit_performance, fit_power_model, fit_thermal_model, suggest_gemm_shapes,
+                           suggest_power_design)
+from .fit_radiation import (calibrate_avf, fit_cross_section, fit_mbu, fit_power_law_to_table, fit_sep_statistics,
+                            flight_update, gamma_scale_posterior, install_environment_tables)
+from .registry import (UncalibratedError, accept_placeholder, declare, placeholder_audit, require_calibrated)
+from .workflow import (CalibrationOptions, CalibrationReport, epistemic_mission_study, load_plan, run_calibration)
+```
+
+### `uchu/calibration/__main__.py`
+
+```python
+import sys
+from .workflow import main
+sys.exit(main())
+```
+
+### `uchu/calibration/data.py`
+
+```python
+"""Calibration data schemas and strict, validated CSV loaders.
+
+Every loader rejects malformed input with ``CalibrationDataError`` and a message naming the file,
+row and column: a calibration silently built on a mis-parsed table is worse than none.
+"""
+from __future__ import annotations
+
+import csv
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from ..config import DType, SpectrumTable
+
+
+class CalibrationDataError(ValueError):
+    """Raised for malformed, physically impossible or insufficient calibration data."""
+
+
+MAX_TILT_DEG = 60.0   # the 1/cos(theta) effective-LET law is not trustworthy beyond ~60 deg
+
+
+def effective_let(let_normal: float, tilt_deg: float = 0.0) -> float:
+    """Cosine-law effective LET.  ``tilt_deg`` = angle between beam and surface normal."""
+    if not 0.0 <= tilt_deg <= MAX_TILT_DEG:
+        raise CalibrationDataError(f"tilt {tilt_deg} deg outside [0, {MAX_TILT_DEG}] (cosine law invalid)")
+    return let_normal / math.cos(math.radians(tilt_deg))
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BeamPoint:
+    """One beam run.  ``x`` = effective LET [MeV cm2/mg] (ions) or energy [MeV] (protons);
+    ``fluence_cm2`` = fluence through the DEVICE SURFACE (already cos-corrected for tilt);
+    ``events`` = observed upsets summed over ``n_units`` identical units (bits / FFs / gates / devices)."""
+    x: float
+    fluence_cm2: float
+    events: int
+    n_units: float = 1.0
+
+
+@dataclass(frozen=True)
+class BeamDataset:
+    name: str
+    region: str                 # sram | register | logic_set | sel
+    kind: str                   # ion | proton
+    points: Tuple[BeamPoint, ...]
+
+    def __post_init__(self):
+        if self.region not in ("sram", "register", "logic_set", "sel"):
+            raise CalibrationDataError(f"{self.name}: unknown region '{self.region}'")
+        if self.kind not in ("ion", "proton"):
+            raise CalibrationDataError(f"{self.name}: kind must be 'ion' or 'proton'")
+        for i, p in enumerate(self.points):
+            if not (math.isfinite(p.x) and p.x > 0):
+                raise CalibrationDataError(f"{self.name} point {i}: x must be positive and finite")
+            if not (math.isfinite(p.fluence_cm2) and p.fluence_cm2 > 0):
+                raise CalibrationDataError(f"{self.name} point {i}: fluence must be positive")
+            if p.events < 0 or int(p.events) != p.events:
+                raise CalibrationDataError(f"{self.name} point {i}: events must be a non-negative integer")
+            if not (math.isfinite(p.n_units) and p.n_units > 0):
+                raise CalibrationDataError(f"{self.name} point {i}: n_units must be positive")
+
+
+@dataclass(frozen=True)
+class PowerMeasurement:
+    T_k: float
+    f_ghz: float
+    v_v: float
+    util: float
+    power_w: float
+
+
+@dataclass(frozen=True)
+class ThermalSample:
+    """Row i describes the interval ENDING at t_s (backward-looking): mean power and eclipse state over
+    that interval, and the temperature at t_s.  The first row is the initial condition (power ignored)."""
+    t_s: float
+    power_w: float
+    eclipse: bool
+    T_k: float
+
+
+@dataclass(frozen=True)
+class PerfMeasurement:
+    M: int
+    K: int
+    N: int
+    dtype: str
+    sparsity: float
+    freq_ghz: float
+    latency_s: float
+
+
+@dataclass(frozen=True)
+class MbuDataset:
+    name: str
+    counts: Dict[int, int]          # cluster size (bits flipped per strike) -> number of strikes
+
+
+@dataclass(frozen=True)
+class SepCatalog:
+    name: str
+    obs_span_s: float
+    durations_s: Tuple[float, ...]
+    intensities_rel: Tuple[float, ...]    # peak intensity relative to the reference event in the SEP tables
+
+
+@dataclass(frozen=True)
+class FlightLog:
+    """Upsets counted by on-board EDAC over known exposure.  ``cfg.orbital`` must describe the flight orbit."""
+    name: str
+    region: str
+    n_units: float
+    segments: Tuple[Tuple[float, float], ...]          # (t0_s, t1_s) of valid monitoring
+    events: int
+    flare_events: Tuple[Tuple[float, float, float], ...] = ()   # (start_s, end_s, intensity) from SEP catalogue
+
+
+@dataclass
+class AvfRequest:
+    field: str = "avf_sram"
+    dtype: str = "int8"
+    tol: float = 1e-2
+    trials_per_bit: int = 100
+    shape: Tuple[int, int, int] = (32, 32, 32)
+
+
+@dataclass
+class DesignFact:
+    path: str
+    value: object
+    source: str
+
+
+@dataclass
+class CalibrationData:
+    env_tables: Dict[str, SpectrumTable] = field(default_factory=dict)
+    env_source: str = ""
+    beam: List[BeamDataset] = field(default_factory=list)
+    mbu: Optional[MbuDataset] = None
+    sep: Optional[SepCatalog] = None
+    power: List[PowerMeasurement] = field(default_factory=list)
+    power_source: str = "power measurements"
+    thermal: List[ThermalSample] = field(default_factory=list)
+    thermal_source: str = "thermal telemetry"
+    perf: List[PerfMeasurement] = field(default_factory=list)
+    perf_source: str = "performance microbenchmarks"
+    flight: List[FlightLog] = field(default_factory=list)
+    avf: List[AvfRequest] = field(default_factory=list)
+    design_facts: List[DesignFact] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# CSV loading
+# ---------------------------------------------------------------------------
+def _rows(path, required: Sequence[str], optional: Sequence[str] = ()):
+    path = Path(path)
+    if not path.exists():
+        raise CalibrationDataError(f"{path}: file not found")
+    with open(path, newline="") as fh:
+        lines = [ln for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        raise CalibrationDataError(f"{path}: empty")
+    rd = csv.DictReader(lines)
+    header = [h.strip() for h in (rd.fieldnames or [])]
+    missing = [c for c in required if c not in header]
+    if missing:
+        raise CalibrationDataError(f"{path}: missing column(s) {missing}; found {header}")
+    out = []
+    for i, row in enumerate(rd, start=2):
+        row = {k.strip(): (v.strip() if v is not None else "") for k, v in row.items() if k}
+        out.append((i, row))
+    if not out:
+        raise CalibrationDataError(f"{path}: no data rows")
+    return path, out
+
+
+def _num(path, i, row, col, default=None, integer=False):
+    raw = row.get(col, "")
+    if raw == "":
+        if default is not None:
+            return default
+        raise CalibrationDataError(f"{path} row {i}: column '{col}' is empty")
+    try:
+        v = float(raw)
+    except ValueError:
+        raise CalibrationDataError(f"{path} row {i}: column '{col}' = '{raw}' is not a number") from None
+    if not math.isfinite(v):
+        raise CalibrationDataError(f"{path} row {i}: column '{col}' is not finite")
+    if integer:
+        if v != int(v):
+            raise CalibrationDataError(f"{path} row {i}: column '{col}' = {raw} must be an integer")
+        return int(v)
+    return v
+
+
+def load_beam_csv(path, region: str, kind: str, name: Optional[str] = None) -> BeamDataset:
+    """ion   : let_mev_cm2_mg, fluence_cm2, events [, tilt_deg, n_units]   (fluence = beam fluence normal to the beam;
+               it is converted to surface fluence F*cos(theta) and LET to LET/cos(theta))
+       proton: energy_mev,     fluence_cm2, events [, n_units]"""
+    xcol = "let_mev_cm2_mg" if kind == "ion" else "energy_mev"
+    path, rows = _rows(path, [xcol, "fluence_cm2", "events"])
+    pts = []
+    for i, r in rows:
+        x = _num(path, i, r, xcol)
+        fl = _num(path, i, r, "fluence_cm2")
+        ev = _num(path, i, r, "events", integer=True)
+        nu = _num(path, i, r, "n_units", default=1.0)
+        if kind == "ion":
+            tilt = _num(path, i, r, "tilt_deg", default=0.0)
+            x = effective_let(x, tilt)
+            fl = fl * math.cos(math.radians(tilt))
+        pts.append(BeamPoint(x, fl, ev, nu))
+    return BeamDataset(name or Path(path).stem, region, kind, tuple(pts))
+
+
+def load_power_csv(path) -> List[PowerMeasurement]:
+    path, rows = _rows(path, ["T_k", "f_ghz", "v_v", "util", "power_w"])
+    out = []
+    for i, r in rows:
+        m = PowerMeasurement(*(_num(path, i, r, c) for c in ("T_k", "f_ghz", "v_v", "util", "power_w")))
+        if not (m.T_k > 0 and m.f_ghz > 0 and m.v_v > 0 and 0 <= m.util <= 1 and m.power_w > 0):
+            raise CalibrationDataError(f"{path} row {i}: physically impossible values {m}")
+        out.append(m)
+    return out
+
+
+def load_thermal_csv(path) -> List[ThermalSample]:
+    path, rows = _rows(path, ["t_s", "power_w", "eclipse", "T_k"])
+    out, last = [], -math.inf
+    for i, r in rows:
+        t = _num(path, i, r, "t_s")
+        if t <= last:
+            raise CalibrationDataError(f"{path} row {i}: t_s must be strictly increasing")
+        last = t
+        ecl = r["eclipse"].lower() in ("1", "true", "yes", "t")
+        if r["eclipse"].lower() not in ("0", "1", "true", "false", "yes", "no", "t", "f"):
+            raise CalibrationDataError(f"{path} row {i}: eclipse must be 0/1/true/false")
+        T = _num(path, i, r, "T_k")
+        if T <= 0:
+            raise CalibrationDataError(f"{path} row {i}: T_k must be positive")
+        out.append(ThermalSample(t, _num(path, i, r, "power_w"), ecl, T))
+    if len(out) < 10:
+        raise CalibrationDataError(f"{path}: need >= 10 samples, got {len(out)}")
+    return out
+
+
+def load_perf_csv(path) -> List[PerfMeasurement]:
+    path, rows = _rows(path, ["M", "K", "N", "dtype", "sparsity", "freq_ghz", "latency_s"])
+    valid = {d.label for d in DType}
+    out = []
+    for i, r in rows:
+        if r["dtype"] not in valid:
+            raise CalibrationDataError(f"{path} row {i}: dtype '{r['dtype']}' not in {sorted(valid)}")
+        sp = _num(path, i, r, "sparsity")
+        if sp not in (0.0, 0.5):
+            raise CalibrationDataError(f"{path} row {i}: sparsity must be 0 or 0.5")
+        lat = _num(path, i, r, "latency_s")
+        if lat <= 0:
+            raise CalibrationDataError(f"{path} row {i}: latency must be positive")
+        out.append(PerfMeasurement(_num(path, i, r, "M", integer=True), _num(path, i, r, "K", integer=True),
+                                   _num(path, i, r, "N", integer=True), r["dtype"], sp,
+                                   _num(path, i, r, "freq_ghz"), lat))
+    return out
+
+
+def load_spectrum_csv(path) -> SpectrumTable:
+    path, rows = _rows(path, ["x", "phi_integral"])
+    x = [_num(path, i, r, "x") for i, r in rows]
+    ph = [_num(path, i, r, "phi_integral") for i, r in rows]
+    tab = SpectrumTable(x, ph)
+    import numpy as np
+    if not (np.all(np.diff(x) > 0) and np.all(np.diff(ph) <= 0) and min(ph) >= 0 and min(x) > 0):
+        raise CalibrationDataError(f"{path}: x must be positive ascending and Phi(>x) non-negative, non-increasing")
+    return tab
+
+
+def load_mbu_csv(path, name: Optional[str] = None) -> MbuDataset:
+    path, rows = _rows(path, ["cluster_size", "count"])
+    counts: Dict[int, int] = {}
+    for i, r in rows:
+        m = _num(path, i, r, "cluster_size", integer=True)
+        c = _num(path, i, r, "count", integer=True)
+        if m < 1 or c < 0:
+            raise CalibrationDataError(f"{path} row {i}: cluster_size >= 1 and count >= 0 required")
+        counts[m] = counts.get(m, 0) + c
+    return MbuDataset(name or Path(path).stem, counts)
+
+
+def load_sep_csv(path, obs_span_s: float, name: Optional[str] = None) -> SepCatalog:
+    path, rows = _rows(path, ["duration_s", "intensity_rel"])
+    d = tuple(_num(path, i, r, "duration_s") for i, r in rows)
+    it = tuple(_num(path, i, r, "intensity_rel") for i, r in rows)
+    if min(d) <= 0 or min(it) <= 0 or obs_span_s <= 0:
+        raise CalibrationDataError(f"{path}: durations, intensities and obs_span_s must be positive")
+    return SepCatalog(name or Path(path).stem, float(obs_span_s), d, it)
+```
+
+### `uchu/calibration/registry.py`
+
+```python
+"""Placeholder registry and provenance ledger.
+
+``SimConfig.calibration`` maps a dotted parameter path to a provenance entry.  ``placeholder_audit`` compares the set of
+parameters the physics depends on against that ledger, so "which numbers in this run are still guesses?" always has a
+machine-checkable answer.  ``require_calibrated`` lets a study refuse to run with unresolved placeholders.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
+
+from ..config import SimConfig
+
+REGIONS = ("sram", "register", "logic_set", "sel")
+KINDS = ("ion", "proton")
+XS_PARAMS = ("sigma_sat_cm2", "x_th", "width", "shape")
+
+STATUS_RESOLVED = ("measured", "derived", "design_fact", "absorbed")
+STATUS_ACCEPTED = "accepted_placeholder"
+
+
+class UncalibratedError(RuntimeError):
+    pass
+
+
+def get_by_path(cfg: Any, path: str):
+    obj = cfg
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def set_by_path(cfg: Any, path: str, value) -> None:
+    *head, last = path.split(".")
+    obj = cfg
+    for part in head:
+        obj = getattr(obj, part)
+    if not hasattr(obj, last):
+        raise AttributeError(f"no config parameter '{path}'")
+    setattr(obj, last, value)
+
+
+def _jsonable(v):
+    if isinstance(v, (np.floating, np.integer)):
+        return v.item()
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(a) for a in v]
+    return v
+
+
+def record(cfg: SimConfig, path: str, *, source: str, method: str, status: str = "measured",
+           value=None, ci: Optional[Iterable[float]] = None, note: str = "") -> None:
+    if status not in STATUS_RESOLVED + (STATUS_ACCEPTED,):
+        raise ValueError(f"unknown status '{status}'")
+    cfg.calibration[path] = {
+        "source": source, "method": method, "status": status,
+        "value": _jsonable(value if value is not None else _safe_get(cfg, path)),
+        "ci95": None if ci is None else [float(c) for c in ci], "note": note}
+
+
+def _safe_get(cfg, path):
+    try:
+        v = get_by_path(cfg, path)
+        return v if isinstance(v, (int, float, str, bool)) else None
+    except AttributeError:
+        return None
+
+
+def declare(cfg: SimConfig, path: str, value, source: str, status: str = "design_fact") -> None:
+    """Set a parameter that is a known design fact (netlist, datasheet, ops decision) and record where it came from."""
+    set_by_path(cfg, path, value)
+    record(cfg, path, source=source, method="declared", status=status, value=value)
+
+
+def accept_placeholder(cfg: SimConfig, path: str, reason: str) -> None:
+    """Explicitly keep a placeholder value, with a reason.  Still reported as unresolved by strict audits."""
+    record(cfg, path, source="analyst", method="accepted", status=STATUS_ACCEPTED, note=reason)
+
+
+def required_paths(cfg: SimConfig) -> List[str]:
+    paths: List[str] = []
+    for r in REGIONS:
+        for k in KINDS:
+            if getattr(getattr(cfg.radiation, r), k).sigma_sat_cm2 > 0:      # sigma_sat == 0 => mechanism not modelled
+                paths += [f"radiation.{r}.{k}.{p}" for p in XS_PARAMS]
+    paths += ["radiation.environment", "radiation.shield_mm_al", "radiation.shield_atten_len_mm",
+              "radiation.mbu_prob", "radiation.mbu_max_cluster", "radiation.mbu_cluster_geom_p",
+              "radiation.avf_sram", "radiation.avf_register", "radiation.avf_logic",
+              "radiation.gates_per_pe", "radiation.reg_bits_per_pe", "radiation.set_pulse_width_ps",
+              "radiation.sel_recovery_s",
+              "orbital.sep_events_per_year", "orbital.sep_mean_duration_s",
+              "orbital.sep_intensity_median", "orbital.sep_intensity_log_sigma",
+              "power.base_power_w", "power.static_frac", "power.clock_frac", "power.interconnect_frac",
+              "power.leak_temp_coeff", "power.interconnect_extra_exponent",
+              "thermal.capacitance_j_per_k", "thermal.radiator_area_m2", "thermal.sun_projected_fraction",
+              "thermal.earth_view_fraction", "thermal.albedo_geometry",
+              "compute.sparse_speedup_at_50", "compute.pipeline_overlap", "memory.hbm_efficiency"]
+    if cfg.memory.ecc_enabled:
+        paths.append("memory.ecc_bw_overhead_pct")
+    if cfg.radiation.tmr_enabled:
+        paths.append("radiation.tmr_residual")
+    return paths
+
+
+@dataclass
+class AuditResult:
+    resolved: Dict[str, dict] = field(default_factory=dict)
+    accepted: Dict[str, dict] = field(default_factory=dict)
+    unresolved: List[str] = field(default_factory=list)
+
+    @property
+    def n_total(self) -> int:
+        return len(self.resolved) + len(self.accepted) + len(self.unresolved)
+
+    def render(self) -> str:
+        lines = [f"{len(self.resolved)}/{self.n_total} parameters calibrated or declared, "
+                 f"{len(self.accepted)} accepted placeholders, {len(self.unresolved)} UNRESOLVED"]
+        lines += [f"  UNRESOLVED  {p}" for p in self.unresolved]
+        lines += [f"  accepted    {p}  ({e['note']})" for p, e in self.accepted.items()]
+        return "\n".join(lines)
+
+
+def placeholder_audit(cfg: SimConfig) -> AuditResult:
+    res = AuditResult()
+    for p in required_paths(cfg):
+        e = cfg.calibration.get(p)
+        if e is None:
+            res.unresolved.append(p)
+        elif e["status"] == STATUS_ACCEPTED:
+            res.accepted[p] = e
+        else:
+            res.resolved[p] = e
+    return res
+
+
+def require_calibrated(cfg: SimConfig, paths: Optional[Iterable[str]] = None, allow_accepted: bool = False) -> None:
+    """Raise ``UncalibratedError`` if any of ``paths`` (default: every required path) is still a placeholder."""
+    a = placeholder_audit(cfg)
+    wanted = set(paths) if paths is not None else None
+    bad = [p for p in a.unresolved if wanted is None or p in wanted]
+    if not allow_accepted:
+        bad += [p for p in a.accepted if wanted is None or p in wanted]
+    if bad:
+        raise UncalibratedError(f"{len(bad)} placeholder parameter(s) unresolved: {sorted(bad)[:8]}"
+                                + (" ..." if len(bad) > 8 else ""))
+```
+
+### `uchu/calibration/fit_radiation.py`
+
+```python
+"""Radiation-side calibration.
+
+  * ``fit_cross_section``   Poisson maximum-likelihood Weibull sigma(x) from beam-test counts, parametric-bootstrap
+                            uncertainty (negative-binomial resampling when over-dispersed), deviance goodness-of-fit
+  * ``fit_mbu``             closed-form MLE of the MBU probability and truncated-geometric cluster-size law
+  * ``fit_sep_statistics``  SEP-event rate / duration / intensity law from an event catalogue
+  * spectrum tools          power-law fit to a CREME/OMERE table, installation of orbit-specific tables
+  * flight update           importance-reweighting of the beam-derived parameter draws by on-orbit EDAC counts
+  * ``calibrate_avf``       measured architectural vulnerability from real bit-flip fault injection
+"""
+from __future__ import annotations
+
+import math
+import warnings
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy import stats
+from scipy.optimize import least_squares, minimize
+
+from ..config import CrossSection, SimConfig, SpectrumParams, SpectrumTable
+from ..faults import measure_gemm_vulnerability
+from ..orbit import FlareSchedule, OrbitalEnvironment
+from ..radiation import RadiationEnvironment
+from ..stats import wilson_ci
+from .data import BeamDataset, CalibrationDataError, MbuDataset, SepCatalog
+from .registry import record
+
+PARAMS = ("sigma_sat_cm2", "x_th", "width", "shape")
+
+
+# ===========================================================================
+# 1.  Weibull cross-section MLE
+# ===========================================================================
+def _mu(theta: np.ndarray, x: np.ndarray, nF: np.ndarray) -> np.ndarray:
+    sig, xth, w, s = theta
+    z = np.clip((x - xth) / w, 0.0, None)
+    return sig * (1.0 - np.exp(-np.power(z, s))) * nF
+
+
+def _nll(mu: np.ndarray, k: np.ndarray) -> float:
+    mu = np.maximum(mu, 1e-300)
+    return float(np.sum(mu - k * np.log(mu)))
+
+
+def _deviance(mu: np.ndarray, k: np.ndarray) -> float:
+    mu = np.maximum(mu, 1e-300)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(k > 0, k * np.log(np.maximum(k, 1.0) / mu), 0.0)
+    return float(2.0 * np.sum(t - (k - mu)))
+
+
+@dataclass
+class CrossSectionFit:
+    dataset: str
+    region: str
+    kind: str
+    xs: CrossSection
+    params: Dict[str, float]
+    ci95: Dict[str, Tuple[float, float]]
+    samples: np.ndarray                      # (B, 4) bootstrap draws in natural units [sigma_sat, x_th, width, shape]
+    deviance: float
+    dof: int
+    p_value: float
+    dispersion: float
+    overdispersed: bool
+    n_points: int
+    n_events: int
+    fixed: Dict[str, float]
+    warnings: List[str] = field(default_factory=list)
+
+    def draw(self, i: int) -> CrossSection:
+        s = self.samples[i % len(self.samples)]
+        return CrossSection(float(s[0]), float(s[1]), float(s[2]), float(s[3]))
+
+
+class _Problem:
+    """Bounds + parametrisation shared by the point fit and every bootstrap refit."""
+
+    def __init__(self, x, nF, k, fixed, shape_bounds, x_th_bounds):
+        self.x, self.nF, self.k, self.fixed = x, nF, k, dict(fixed)
+        sig_meas = k / nF
+        sig_max = float(sig_meas.max())
+        x_first = float(x[k > 0].min())
+        lo_xth = x_th_bounds[0] if x_th_bounds else float(x.min()) / 20.0
+        hi_xth = x_first * (1 - 1e-6)
+        rng_x = float(x.max() - x.min())
+        self.bounds = {
+            "sigma_sat_cm2": (0.3 * sig_max, 1e3 * sig_max),
+            "x_th": (min(lo_xth, hi_xth * 0.999), hi_xth),
+            "width": (max(0.01 * rng_x, 1e-6), 20.0 * float(x.max())),
+            "shape": shape_bounds,
+        }
+        self.free = [p for p in PARAMS if p not in self.fixed]
+        self.sig_max, self.x_first, self.rng_x = sig_max, x_first, rng_x
+
+    def expand(self, u: np.ndarray) -> np.ndarray:
+        th = dict(self.fixed)
+        th.update({p: math.exp(v) for p, v in zip(self.free, u)})
+        return np.array([th[p] for p in PARAMS])
+
+    def to_u(self, theta: np.ndarray) -> np.ndarray:
+        d = dict(zip(PARAMS, theta))
+        return np.array([math.log(d[p]) for p in self.free])
+
+    @property
+    def ubounds(self):
+        return [(math.log(self.bounds[p][0]), math.log(self.bounds[p][1])) for p in self.free]
+
+    def with_counts(self, k):
+        c = _Problem.__new__(_Problem)
+        c.__dict__.update(self.__dict__)
+        c.k = k
+        return c
+
+    def nll(self, u):
+        return _nll(_mu(self.expand(u), self.x, self.nF), self.k)
+
+
+def _local(prob: _Problem, u0: np.ndarray) -> Tuple[np.ndarray, float]:
+    r = minimize(prob.nll, u0, method="L-BFGS-B", bounds=prob.ubounds,
+                 options={"ftol": 1e-13, "gtol": 1e-9, "maxiter": 600})
+    return r.x, float(r.fun)
+
+
+def _global(prob: _Problem, rng: np.random.Generator, n_random: int = 14) -> Tuple[np.ndarray, float]:
+    ub = prob.ubounds
+    lo, hi = np.array([b[0] for b in ub]), np.array([b[1] for b in ub])
+    starts = []
+    for sh in (1.0, 2.0, 3.0):
+        for wf in (0.15, 0.5):
+            th = {"sigma_sat_cm2": 1.1 * prob.sig_max, "x_th": 0.8 * prob.x_first,
+                  "width": wf * prob.rng_x, "shape": sh}
+            th.update(prob.fixed)
+            th = {p: float(np.clip(th[p], *prob.bounds[p])) for p in PARAMS}
+            starts.append(prob.to_u(np.array([th[p] for p in PARAMS])))
+    starts += [rng.uniform(lo, hi) for _ in range(n_random)]
+    scored = sorted(((prob.nll(u), i) for i, u in enumerate(starts)))[:6]
+    best_u, best_f = None, math.inf
+    for _, i in scored:
+        u, f = _local(prob, np.clip(starts[i], lo, hi))
+        if f < best_f:
+            best_u, best_f = u, f
+    return best_u, best_f
+
+
+def fit_cross_section(ds: BeamDataset, rng: np.random.Generator, n_boot: int = 200,
+                      fix: Optional[Dict[str, float]] = None, shape_bounds=(0.5, 6.0),
+                      x_th_bounds: Optional[Tuple[float, float]] = None) -> CrossSectionFit:
+    pts = ds.points
+    if len(pts) < 4:
+        raise CalibrationDataError(f"{ds.name}: need >= 4 beam points, got {len(pts)}")
+    x = np.array([p.x for p in pts], float)
+    nF = np.array([p.n_units * p.fluence_cm2 for p in pts], float)
+    k = np.array([p.events for p in pts], float)
+    if k.sum() == 0:
+        raise CalibrationDataError(f"{ds.name}: zero events at every point; only an upper limit exists "
+                                   f"(sigma < {3.0 / nF.max():.3g} cm2/unit at 95 %), not a Weibull fit")
+    fixed = dict(fix or {})
+    prob = _Problem(x, nF, k, fixed, shape_bounds, x_th_bounds)
+    warn: List[str] = []
+    n_free = len(prob.free)
+    if len(np.unique(x)) < n_free + 1:
+        warn.append(f"only {len(np.unique(x))} distinct x values for {n_free} free parameters: poorly constrained")
+
+    u_hat, _ = _global(prob, rng)
+    theta = prob.expand(u_hat)
+    mu_hat = _mu(theta, x, nF)
+    D = _deviance(mu_hat, k)
+    dof = len(x) - n_free
+    phi = D / dof if dof > 0 else float("nan")
+
+    def bootstrap(draw_counts) -> Tuple[np.ndarray, np.ndarray]:
+        thetas, devs = [], []
+        for _ in range(n_boot):
+            kb = draw_counts()
+            if kb.sum() == 0:
+                continue
+            pb = prob.with_counts(kb)
+            cands = [_local(pb, u_hat), _local(pb, np.clip(u_hat + rng.normal(0, 0.25, len(u_hat)),
+                                                           [b[0] for b in prob.ubounds], [b[1] for b in prob.ubounds]))]
+            ub, _ = min(cands, key=lambda c: c[1])
+            th_b = pb.expand(ub)
+            thetas.append(th_b)
+            devs.append(_deviance(_mu(th_b, x, nF), kb))
+        return np.array(thetas), np.array(devs)
+
+    th1, d1 = bootstrap(lambda: rng.poisson(mu_hat).astype(float))
+    if len(d1) < 0.5 * n_boot:
+        raise CalibrationDataError(f"{ds.name}: bootstrap degenerate ({len(d1)}/{n_boot} usable draws)")
+    p_val = float((1 + np.sum(d1 >= D)) / (len(d1) + 1)) if dof > 0 else float("nan")
+    overdisp = bool(dof > 0 and p_val < 0.05)
+    samples = th1
+    if overdisp:
+        g = max(phi, 1.0 + 1e-6)
+        warn.append(f"over-dispersed (deviance/dof = {phi:.2f}, bootstrap p = {p_val:.3f}): the Poisson model does not "
+                    f"explain the scatter (fluence/dosimetry errors? SEL/SEFI contamination?). Intervals widened with a "
+                    f"negative-binomial resample; investigate before trusting the point estimate.")
+        th2, _ = bootstrap(lambda: rng.poisson(rng.gamma(np.maximum(mu_hat, 1e-12) / (g - 1.0), g - 1.0)).astype(float))
+        samples = th2
+    frac_trans = float(np.mean((mu_hat > 0.02 * theta[0] * nF) & (mu_hat < 0.95 * theta[0] * nF)))
+    if np.sum((mu_hat > 0.02 * theta[0] * nF) & (mu_hat < 0.95 * theta[0] * nF)) < 3:
+        warn.append("fewer than 3 points on the rising part of the curve: width/shape poorly constrained")
+    frac_sat = float(1.0 - math.exp(-max((x.max() - theta[1]) / theta[2], 0.0) ** theta[3]))
+    if frac_sat < 0.9:
+        warn.append(f"saturation not reached within the tested range (fitted curve is at {frac_sat:.0%} of sigma_sat at the "
+                    f"largest tested x): sigma_sat is an extrapolation")
+    sat_spread = np.percentile(samples[:, 0], 97.5) / max(np.percentile(samples[:, 0], 2.5), 1e-300)
+    if sat_spread > 3.0:
+        warn.append(f"sigma_sat 95 % interval spans a factor {sat_spread:.1f}")
+    at_bound = [p for p, v in zip(PARAMS, theta) if p in prob.free and
+                (abs(math.log(v) - math.log(prob.bounds[p][0])) < 1e-3 or abs(math.log(v) - math.log(prob.bounds[p][1])) < 1e-3)]
+    if at_bound:
+        warn.append(f"estimate sits on a search bound for {at_bound}: constrain it physically or collect more data")
+
+    lo, hi = np.percentile(samples, [2.5, 97.5], axis=0)
+    return CrossSectionFit(
+        dataset=ds.name, region=ds.region, kind=ds.kind,
+        xs=CrossSection(*[float(v) for v in theta]), params=dict(zip(PARAMS, map(float, theta))),
+        ci95={p: (float(lo[i]), float(hi[i])) for i, p in enumerate(PARAMS)}, samples=samples,
+        deviance=D, dof=dof, p_value=p_val, dispersion=phi, overdispersed=overdisp,
+        n_points=len(x), n_events=int(k.sum()), fixed=fixed, warnings=warn)
+
+
+def apply_cross_section_fit(cfg: SimConfig, fit: CrossSectionFit, source: Optional[str] = None) -> None:
+    reg = getattr(cfg.radiation, fit.region)
+    setattr(reg, fit.kind, CrossSection(**fit.params))
+    for p in PARAMS:
+        status = "derived" if p in fit.fixed else "measured"
+        record(cfg, f"radiation.{fit.region}.{fit.kind}.{p}", source=source or fit.dataset,
+               method="Poisson MLE (Weibull) + parametric bootstrap", status=status, value=fit.params[p],
+               ci=fit.ci95[p], note=f"deviance/dof={fit.dispersion:.2f}, p={fit.p_value:.3f}" + (
+                   "; OVERDISPERSED" if fit.overdispersed else ""))
+
+
+def cross_section_upper_limit(events: int, fluence_cm2: float, n_units: float = 1.0, conf: float = 0.95) -> float:
+    """One-sided upper limit on sigma per unit when ``events`` were seen (3 / (nF) for zero events at 95 %)."""
+    return float(stats.chi2.ppf(conf, 2 * (events + 1)) / 2.0 / (fluence_cm2 * n_units))
+
+
+# ===========================================================================
+# 2.  MBU multiplicity
+# ===========================================================================
+@dataclass
+class MbuFit:
+    dataset: str
+    p_mbu: float
+    p_mbu_ci95: Tuple[float, float]
+    geom_p: float
+    geom_p_ci95: Tuple[float, float]
+    max_cluster: int
+    n_strikes: int
+    chi2_p_value: float
+    p_samples: np.ndarray
+    q_samples: np.ndarray
+    warnings: List[str] = field(default_factory=list)
+
+
+def _cluster_pmf(q: float, max_cluster: int) -> np.ndarray:
+    """P(size = m | MBU), m = 2..max_cluster, truncated geometric (matches RadiationSubsystem._cluster_sizes)."""
+    m = np.arange(2, max_cluster + 1)
+    pmf = q * (1 - q) ** (m - 2)
+    pmf[-1] = (1 - q) ** (max_cluster - 2)
+    return pmf
+
+
+def fit_mbu(ds: MbuDataset, rng: np.random.Generator, max_cluster: Optional[int] = None, n_draw: int = 500) -> MbuFit:
+    counts = {int(m): int(c) for m, c in ds.counts.items() if c > 0}
+    N = sum(counts.values())
+    if N < 20:
+        raise CalibrationDataError(f"{ds.name}: need >= 20 strikes, got {N}")
+    n_multi = sum(c for m, c in counts.items() if m >= 2)
+    if n_multi < 5:
+        raise CalibrationDataError(f"{ds.name}: only {n_multi} multi-bit strikes; cluster law not identifiable")
+    M = int(max_cluster or max(counts))
+    if M < 2:
+        raise CalibrationDataError("max_cluster must be >= 2")
+    warn: List[str] = []
+    if any(m > M for m in counts):
+        raise CalibrationDataError(f"{ds.name}: observed cluster size > max_cluster={M}")
+    p = n_multi / N
+    n_stop = sum(c for m, c in counts.items() if 2 <= m < M)          # geometric "success" events
+    n_cont = sum(c * (m - 2) for m, c in counts.items() if m >= 2)    # geometric "failure" events
+    q = n_stop / (n_stop + n_cont) if (n_stop + n_cont) > 0 else 1.0
+    q = min(max(q, 1e-6), 1.0)
+    q_ci = wilson_ci(n_stop, n_stop + n_cont) if n_stop + n_cont > 0 else (0.0, 1.0)
+    exp = np.array([n_multi * v for v in _cluster_pmf(q, M)])
+    obs = np.array([counts.get(m, 0) for m in range(2, M + 1)], float)
+    # pool bins with expected < 5 into the last bin
+    while len(exp) > 2 and exp[-1] < 5:
+        exp[-2] += exp[-1]; obs[-2] += obs[-1]; exp, obs = exp[:-1], obs[:-1]
+    dof = len(exp) - 2
+    pval = float(stats.chi2.sf(np.sum((obs - exp) ** 2 / np.maximum(exp, 1e-12)), dof)) if dof > 0 else float("nan")
+    if max(counts) == M and counts.get(M, 0) > 0:
+        warn.append(f"largest observed cluster ({M}) is the truncation point: the tail beyond it is unobserved")
+    if q_ci[1] - q_ci[0] > 0.4:
+        warn.append("cluster-size law poorly constrained (few multi-bit strikes)")
+    return MbuFit(ds.name, p, wilson_ci(n_multi, N), q, q_ci, M, N, pval,
+                  rng.beta(n_multi + 0.5, N - n_multi + 0.5, size=n_draw),
+                  rng.beta(n_stop + 0.5, n_cont + 0.5, size=n_draw), warn)
+
+
+def apply_mbu_fit(cfg: SimConfig, fit: MbuFit) -> None:
+    cfg.radiation.mbu_prob, cfg.radiation.mbu_cluster_geom_p = fit.p_mbu, fit.geom_p
+    cfg.radiation.mbu_max_cluster = fit.max_cluster
+    record(cfg, "radiation.mbu_prob", source=fit.dataset, method="binomial MLE + Wilson", value=fit.p_mbu, ci=fit.p_mbu_ci95)
+    record(cfg, "radiation.mbu_cluster_geom_p", source=fit.dataset, method="truncated-geometric MLE + Wilson",
+           value=fit.geom_p, ci=fit.geom_p_ci95, note=f"chi2 p={fit.chi2_p_value:.3f}")
+    record(cfg, "radiation.mbu_max_cluster", source=fit.dataset, method="largest observed cluster", status="derived",
+           value=fit.max_cluster)
+
+
+# ===========================================================================
+# 3.  SEP statistics
+# ===========================================================================
+@dataclass
+class SepFit:
+    dataset: str
+    n_events: int
+    rate_per_year: float
+    rate_ci95: Tuple[float, float]
+    mean_duration_s: float
+    duration_ci95: Tuple[float, float]
+    median_intensity: float
+    median_ci95: Tuple[float, float]
+    log_sigma: float
+    log_sigma_ci95: Tuple[float, float]
+    samples: np.ndarray            # (n, 4): rate/yr, mean_dur, median, log_sigma
+    warnings: List[str] = field(default_factory=list)
+
+
+def fit_sep_statistics(cat: SepCatalog, rng: np.random.Generator, n_draw: int = 500, conf: float = 0.95) -> SepFit:
+    n = len(cat.durations_s)
+    if n < 3:
+        raise CalibrationDataError(f"{cat.name}: need >= 3 SEP events, got {n}")
+    a = 1 - conf
+    yr = 365.25 * 86400.0
+    rate = n / cat.obs_span_s * yr
+    r_lo = 0.5 * stats.chi2.ppf(a / 2, 2 * n) / cat.obs_span_s * yr
+    r_hi = 0.5 * stats.chi2.ppf(1 - a / 2, 2 * (n + 1)) / cat.obs_span_s * yr
+    d = np.asarray(cat.durations_s)
+    dm = float(d.mean())
+    d_ci = (2 * n * dm / stats.chi2.ppf(1 - a / 2, 2 * n), 2 * n * dm / stats.chi2.ppf(a / 2, 2 * n))
+    li = np.log(np.asarray(cat.intensities_rel))
+    mu, sd = float(li.mean()), float(li.std(ddof=1))
+    tq = stats.t.ppf(1 - a / 2, n - 1) * sd / math.sqrt(n)
+    s_ci = (sd * math.sqrt((n - 1) / stats.chi2.ppf(1 - a / 2, n - 1)), sd * math.sqrt((n - 1) / stats.chi2.ppf(a / 2, n - 1)))
+    warn = []
+    if n < 10:
+        warn.append(f"only {n} SEP events: rate and intensity law are weakly constrained (heavy tail unobserved)")
+    # draws: Jeffreys posterior for rate; inverse-gamma for mean duration; t / chi2 for lognormal
+    rate_d = rng.gamma(n + 0.5, 1.0 / cat.obs_span_s, n_draw) * yr
+    dur_d = (n * dm) / rng.gamma(n, 1.0, n_draw)
+    sig_d = sd * np.sqrt((n - 1) / rng.chisquare(n - 1, n_draw))
+    med_d = np.exp(mu + sig_d / math.sqrt(n) * rng.standard_t(n - 1, n_draw))
+    return SepFit(cat.name, n, rate, (r_lo, r_hi), dm, d_ci, math.exp(mu), (math.exp(mu - tq), math.exp(mu + tq)),
+                  sd, s_ci, np.column_stack([rate_d, dur_d, med_d, sig_d]), warn)
+
+
+def apply_sep_fit(cfg: SimConfig, fit: SepFit) -> None:
+    o = cfg.orbital
+    o.sep_events_per_year, o.sep_mean_duration_s = fit.rate_per_year, fit.mean_duration_s
+    o.sep_intensity_median, o.sep_intensity_log_sigma = fit.median_intensity, fit.log_sigma
+    src = fit.dataset
+    record(cfg, "orbital.sep_events_per_year", source=src, method="Poisson MLE (Garwood)", value=fit.rate_per_year, ci=fit.rate_ci95)
+    record(cfg, "orbital.sep_mean_duration_s", source=src, method="exponential MLE", value=fit.mean_duration_s, ci=fit.duration_ci95)
+    record(cfg, "orbital.sep_intensity_median", source=src, method="lognormal MLE", value=fit.median_intensity, ci=fit.median_ci95)
+    record(cfg, "orbital.sep_intensity_log_sigma", source=src, method="lognormal MLE", value=fit.log_sigma, ci=fit.log_sigma_ci95)
+
+
+# ===========================================================================
+# 4.  Environment spectra
+# ===========================================================================
+@dataclass
+class PowerLawFit:
+    params: SpectrumParams
+    max_rel_error: float
+    warnings: List[str]
+
+
+def fit_power_law_to_table(tab: SpectrumTable, x_lo: Optional[float] = None, x_hi: Optional[float] = None,
+                           x_ref: float = 1.0) -> PowerLawFit:
+    """Least-squares (log space) fit of Phi(>x) = A[(x/xr)^-g - (xm/xr)^-g] to a table, over [x_lo, x_hi).
+    Use for sensitivity studies; prefer the table itself (``install_environment_tables``) for the baseline."""
+    x, ph = np.asarray(tab.x), np.asarray(tab.phi_integral)
+    x_lo = x_lo or x[0]
+    x_hi = x_hi or x[-1] * 1.0000001
+    m = (x >= x_lo) & (x < x_hi) & (ph > 0)
+    if m.sum() < 4:
+        raise CalibrationDataError("need >= 4 positive table points in the fitting range")
+    xs, ys = x[m], np.log(ph[m])
+    g0 = max(0.1, -np.polyfit(np.log(xs), ys, 1)[0])
+    A0 = float(np.exp(np.polyval(np.polyfit(np.log(xs), ys, 1), np.log(x_ref))))
+
+    def res(v):
+        A, g = math.exp(v[0]), math.exp(v[1])
+        model = A * ((xs / x_ref) ** -g - (x_hi / x_ref) ** -g)
+        return np.log(np.maximum(model, 1e-300)) - ys
+    r = least_squares(res, [math.log(A0), math.log(g0)])
+    A, g = math.exp(r.x[0]), math.exp(r.x[1])
+    err = float(np.max(np.abs(np.exp(res(r.x)) - 1.0)))
+    w = []
+    if err > 0.3:
+        w.append(f"power law misses the table by up to {err:.0%}: use the table directly for baseline rates")
+    return PowerLawFit(SpectrumParams(A, x_ref, g, float(x_hi)), err, w)
+
+
+def check_table_coverage(cfg: SimConfig, tables: Dict[str, SpectrumTable]) -> List[str]:
+    """Warn when a table starts above a cross-section threshold (flux below the table is assumed zero)."""
+    out = []
+    comp_x = {"gcr_ion": ("ion", "x_th"), "sep_ion": ("ion", "x_th"),
+              "trapped_proton": ("proton", "x_th"), "sep_proton": ("proton", "x_th")}
+    for key, tab in tables.items():
+        kind = comp_x[key][0]
+        for r in ("sram", "register", "logic_set", "sel"):
+            xs = getattr(getattr(cfg.radiation, r), kind)
+            if xs.sigma_sat_cm2 > 0 and tab.x[0] > xs.x_th:
+                out.append(f"table '{key}' starts at x={tab.x[0]:.3g}, above {r}.{kind} threshold {xs.x_th:.3g}: "
+                           f"flux below the table is treated as zero (non-conservative)")
+    return out
+
+
+def install_environment_tables(cfg: SimConfig, tables: Dict[str, SpectrumTable], source: str) -> List[str]:
+    """Switch to orbit-specific tabulated spectra.  The tables must already include geomagnetic shielding,
+    solar-cycle modulation, trapped-belt content and spacecraft shielding; ALL placeholder orbit scalings are bypassed.
+    The ``sep_*`` tables describe the reference SEP event (intensity = 1)."""
+    cfg.radiation.environment_mode = "tabulated_orbit"
+    cfg.radiation.tables = {k: SpectrumTable(list(t.x), list(t.phi_integral)) for k, t in tables.items()}
+    cfg.validate()
+    record(cfg, "radiation.environment", source=source, method="orbit-specific tabulated flux (CREME96/OMERE/AP-9)",
+           status="measured", value="tabulated_orbit", note="tables: " + ",".join(sorted(tables)))
+    for p in ("radiation.shield_mm_al", "radiation.shield_atten_len_mm"):
+        record(cfg, p, source=source, method="embedded in tabulated flux", status="absorbed", value=None,
+               note="shielding applied when the tables were generated")
+    return check_table_coverage(cfg, tables)
+
+
+# ===========================================================================
+# 5.  Flight-data update
+# ===========================================================================
+def expected_events_for_flight(cfg: SimConfig, region: str, n_units: float,
+                               segments: Sequence[Tuple[float, float]],
+                               flare_events: Sequence[Tuple[float, float, float]] = ()) -> float:
+    orbit = OrbitalEnvironment(cfg.orbital)
+    orbit.flares = FlareSchedule.from_events(flare_events)
+    env = RadiationEnvironment(cfg, orbit)
+    return float(sum(env.expected(region, n_units, t0, t1) for t0, t1 in segments))
+
+
+@dataclass
+class FlightUpdate:
+    log: str
+    observed: int
+    expected_prior_mean: float
+    weights: np.ndarray
+    ess: float
+    p_consistency: float
+    posterior_multiplier_median: float
+    posterior_multiplier_ci95: Tuple[float, float]
+    warnings: List[str] = field(default_factory=list)
+
+
+def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: Sequence[float]) -> np.ndarray:
+    o = np.argsort(values)
+    v, w = values[o], weights[o]
+    cw = np.cumsum(w) - 0.5 * w
+    cw /= w.sum()
+    return np.interp(q, cw, v)
+
+
+def flight_update(E_draws: np.ndarray, k_obs: int, discrepancy_log_sigma: float = 0.0,
+                  log: str = "flight", n_gh: int = 41) -> FlightUpdate:
+    """Importance-reweight parameter draws (each predicting E_j expected events) by the flight count.
+    ``discrepancy_log_sigma`` is a lognormal model-discrepancy nuisance (environment/geometry errors the beam data
+    cannot know about); 0 trusts the model exactly."""
+    E = np.asarray(E_draws, float)
+    if discrepancy_log_sigma > 0:
+        z, wz = np.polynomial.hermite_e.hermegauss(n_gh)
+        delta = np.exp(discrepancy_log_sigma * z)
+        wz = wz / wz.sum()
+        mu = E[:, None] * delta[None, :]
+        like = (stats.poisson.pmf(k_obs, mu) * wz[None, :]).sum(axis=1)
+        cdf_le = (stats.poisson.cdf(k_obs, mu) * wz).sum(axis=1).mean()
+        cdf_ge = (stats.poisson.sf(k_obs - 1, mu) * wz).sum(axis=1).mean()
+    else:
+        like = stats.poisson.pmf(k_obs, E)
+        cdf_le, cdf_ge = stats.poisson.cdf(k_obs, E).mean(), stats.poisson.sf(k_obs - 1, E).mean()
+    p_cons = float(min(1.0, 2.0 * min(cdf_le, cdf_ge)))
+    w = like / like.sum() if like.sum() > 0 else np.full(len(E), 1.0 / len(E))
+    ess = float(1.0 / np.sum(w ** 2))
+    mult = E / np.mean(E)
+    q = weighted_quantile(mult, w, [0.025, 0.5, 0.975])
+    warn = []
+    if p_cons < 0.01:
+        warn.append(f"flight count {k_obs} is inconsistent with the beam-derived model (prior-predictive p = {p_cons:.2g}): "
+                    f"suspect environment/shielding/geometry or SEE mechanisms absent from the beam data")
+    if ess < 0.1 * len(E):
+        warn.append(f"effective sample size {ess:.0f}/{len(E)}: flight data strongly disagree with most draws; "
+                    f"increase draws or add a model-discrepancy term")
+    return FlightUpdate(log, int(k_obs), float(np.mean(E)), w, ess, p_cons, float(q[1]), (float(q[0]), float(q[2])), warn)
+
+
+def gamma_scale_posterior(k_obs: int, E_expected: float, conf: float = 0.95) -> Tuple[float, Tuple[float, float]]:
+    """Jeffreys Gamma(k + 1/2, E) posterior for a multiplicative rate correction s (k ~ Poisson(s E))."""
+    d = stats.gamma(k_obs + 0.5, scale=1.0 / E_expected)
+    a = (1 - conf) / 2
+    return float(d.mean()), (float(d.ppf(a)), float(d.ppf(1 - a)))
+
+
+# ===========================================================================
+# 6.  Architectural vulnerability by fault injection
+# ===========================================================================
+def calibrate_avf(cfg: SimConfig, field_name: str = "avf_sram", dtype: str = "int8", tol: float = 1e-2,
+                  trials_per_bit: int = 100, shape: Tuple[int, int, int] = (32, 32, 32), seed: int = 0,
+                  conservative: bool = True):
+    """Measure P(output corrupted beyond ``tol`` | single operand bit flip) and store it (upper CI bound if conservative)."""
+    if field_name not in ("avf_sram",):
+        raise ValueError("operand-flip injection measures memory (avf_sram) only; register/logic AVF needs RTL "
+                         "fault injection: use registry.declare() with that result")
+    r = measure_gemm_vulnerability(*shape, dtype=dtype, tol=tol, trials_per_bit=trials_per_bit, seed=seed)
+    val = r.ci_high if conservative else r.avf
+    setattr(cfg.radiation, field_name, float(val))
+    record(cfg, f"radiation.{field_name}", source=f"GEMM bit-flip injection {dtype} {shape} tol={tol}",
+           method="Monte-Carlo fault injection + Wilson", value=float(val), ci=(r.ci_low, r.ci_high),
+           note=("upper 95 % bound used (conservative)" if conservative else "point estimate"))
+    return r
+```
+
+### `uchu/calibration/fit_hardware.py`
+
+```python
+"""Hardware-side calibration: power model, lumped thermal model, performance (roofline) parameters.
+
+Each fit reports parameter covariance from the Jacobian, a condition-number identifiability check on the *measurement
+design* (non-identifiable designs raise ``CalibrationDataError`` instead of returning confident nonsense), and
+parameter draws for epistemic-uncertainty propagation.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy.optimize import least_squares
+
+from ..config import DType, OrbitType, ProcessNode, SimConfig
+from ..memory import WorkloadLayer, estimate_layer
+from ..thermal import SIGMA_SB
+from .data import CalibrationDataError, PerfMeasurement, PowerMeasurement, ThermalSample
+from .registry import record
+
+COND_WARN, COND_FATAL = 1e4, 1e7
+
+
+def _covariance(res, n_obs: int, names: Sequence[str], scale: Optional[np.ndarray] = None):
+    """Wald covariance from the Jacobian.  Identifiability (condition number / weakest direction) is judged on the
+    Jacobian with each column multiplied by that parameter's plausible range, so it does not depend on units."""
+    J = res.jac
+    n_par = J.shape[1]
+    dof = max(n_obs - n_par, 1)
+    s2 = float(np.sum(res.fun ** 2) / dof)
+    Js = J if scale is None else J * np.asarray(scale)[None, :]
+    sv = np.linalg.svd(Js, compute_uv=False)
+    cond = float(sv[0] / max(sv[-1], 1e-300))
+    warn: List[str] = []
+    if cond > COND_FATAL:
+        _, _, vt = np.linalg.svd(Js)
+        weak = names[int(np.argmax(np.abs(vt[-1])))]
+        raise CalibrationDataError(f"measurement design cannot identify the parameters (condition number {cond:.2g}; "
+                                   f"weakest direction is dominated by '{weak}'): add measurements that vary it independently")
+    if cond > COND_WARN:
+        warn.append(f"ill-conditioned design (condition number {cond:.2g}): some parameters are strongly correlated")
+    return s2 * np.linalg.pinv(J.T @ J), float(math.sqrt(s2)), warn, cond
+
+
+def _ci(theta: np.ndarray, cov: np.ndarray, lo_hi=None) -> np.ndarray:
+    se = np.sqrt(np.maximum(np.diag(cov), 0))
+    return np.column_stack([theta - 1.96 * se, theta + 1.96 * se])
+
+
+# ===========================================================================
+# Power model
+# ===========================================================================
+@dataclass
+class PowerFit:
+    S_w: float
+    D_w: float
+    leak_temp_coeff: float
+    clock_frac: float
+    config_values: Dict[str, float]
+    ci95: Dict[str, Tuple[float, float]]
+    rel_rms_error: float
+    cond: float
+    samples: np.ndarray                 # (n, 4) draws of base_power_w, static_frac, leak_temp_coeff, clock_frac
+    n_points: int
+    warnings: List[str] = field(default_factory=list)
+
+
+def _power_pred(u, T, f, v, util, cfg, ic_scale):
+    S, D, k, c = math.exp(u[0]), math.exp(u[1]), u[2], u[3]
+    ic = cfg.power.interconnect_frac
+    fr, vr = f / cfg.dvfs.nom_freq_ghz, v / cfg.dvfs.nom_voltage_v
+    act = (1.0 - c - ic) + ic * ic_scale
+    return S * np.exp(k * (T - cfg.power.T_nom_k) / cfg.power.T_nom_k) * vr ** 3 + D * fr * vr ** 2 * (c + act * util)
+
+
+def power_to_config_values(cfg: SimConfig, S: float, D: float) -> Tuple[float, float]:
+    """Invert PowerModel's scaling: (static_nom_w, dynamic_nom_w) -> (base_power_w, static_frac) for THIS chip."""
+    comp, pw = cfg.compute, cfg.power
+    area_ratio = comp.area_mm2 / pw.ref_area_mm2
+    array_ratio = (comp.array_size / pw.ref_array_size) ** 2
+    ref = ProcessNode[pw.ref_node]
+    stat = S / (area_ratio * comp.process_node.leakage_factor() / ref.leakage_factor())
+    dyn = D / (array_ratio * comp.process_node.cap_factor() / ref.cap_factor())
+    return stat + dyn, stat / (stat + dyn)
+
+
+def fit_power_model(meas: Sequence[PowerMeasurement], cfg: SimConfig, rng: np.random.Generator,
+                    n_draw: int = 500) -> PowerFit:
+    if len(meas) < 8:
+        raise CalibrationDataError(f"need >= 8 power measurements, got {len(meas)}")
+    a = {n: np.array([getattr(m, n) for m in meas], float) for n in ("T_k", "f_ghz", "v_v", "util", "power_w")}
+    array_ratio = (cfg.compute.array_size / cfg.power.ref_array_size) ** 2
+    ic_scale = array_ratio ** cfg.power.interconnect_extra_exponent
+    c_hi = 0.95 - cfg.power.interconnect_frac
+    P = a["power_w"]
+
+    def resid(u):
+        return (_power_pred(u, a["T_k"], a["f_ghz"], a["v_v"], a["util"], cfg, ic_scale) - P) / P
+
+    lo = np.array([math.log(1e-3), math.log(1e-3), 0.0, 0.0])
+    hi = np.array([math.log(1e4), math.log(1e4), 12.0, c_hi])
+    best = None
+    for S0 in (0.2, 0.5, 0.8):
+        for k0 in (2.0, 5.0):
+            u0 = np.array([math.log(S0 * P.mean()), math.log((1 - S0) * P.mean()), k0, 0.1])
+            r = least_squares(resid, np.clip(u0, lo + 1e-9, hi - 1e-9), bounds=(lo, hi))
+            if best is None or r.cost < best.cost:
+                best = r
+    cov, sig, warn, cond = _covariance(best, len(P), ["ln S (static)", "ln D (dynamic)", "leak_temp_coeff", "clock_frac"], hi - lo)
+    u = best.x
+    at_bound = [n for n, v, l, h in zip(["static", "dynamic", "leak_temp_coeff", "clock_frac"], u, lo, hi)
+                if min(v - l, h - v) < 1e-6]
+    if at_bound:
+        warn.append(f"estimate at a bound for {at_bound}: Wald interval invalid for those parameters")
+    draws = rng.multivariate_normal(u, cov, size=n_draw, check_valid="ignore")
+    draws = np.clip(draws, lo, hi)
+    S, D = math.exp(u[0]), math.exp(u[1])
+    base, sf = power_to_config_values(cfg, S, D)
+    d_base, d_sf = zip(*(power_to_config_values(cfg, math.exp(d[0]), math.exp(d[1])) for d in draws))
+    samples = np.column_stack([d_base, d_sf, draws[:, 2], draws[:, 3]])
+    lo_hi = np.percentile(samples, [2.5, 97.5], axis=0)
+    names = ["base_power_w", "static_frac", "leak_temp_coeff", "clock_frac"]
+    ci = {n: (float(lo_hi[0, i]), float(lo_hi[1, i])) for i, n in enumerate(names)}
+    if cfg.power.interconnect_frac > 0:
+        warn.append("interconnect_frac is not identifiable from chip-level power (it only splits the active power); "
+                    "supply it from post-layout analysis via registry.declare()")
+    return PowerFit(S, D, float(u[2]), float(u[3]), dict(zip(names, [base, sf, float(u[2]), float(u[3])])), ci,
+                    float(np.sqrt(np.mean(best.fun ** 2))), cond, samples, len(P), warn)
+
+
+def apply_power_fit(cfg: SimConfig, fit: PowerFit, source: str) -> None:
+    for n, v in fit.config_values.items():
+        setattr(cfg.power, n, v)
+        record(cfg, f"power.{n}", source=source, method="nonlinear least squares (relative residuals) + Wald/MVN",
+               value=v, ci=fit.ci95[n], note=f"rms rel. error {fit.rel_rms_error:.3%}, cond {fit.cond:.1e}")
+
+
+def suggest_power_design() -> List[dict]:
+    """Minimum measurement design that identifies (static, dynamic, leakage slope, clock share)."""
+    return [{"T_k": T, "f_frac": f, "v_frac": v, "util": u}
+            for T in (300.0, 340.0, 380.0) for (f, v) in ((1.0, 1.0), (0.6, 0.8)) for u in (0.0, 0.5, 1.0)]
+
+
+# ===========================================================================
+# Thermal model
+# ===========================================================================
+def integrate_thermal(C: float, kr: float, Q_sun: float, Q_ecl: float, t: np.ndarray, P: np.ndarray,
+                      ecl: np.ndarray, T0: float) -> np.ndarray:
+    """Backward-Euler / Newton integration of  C dT/dt = P + Q - kr T^4  (same equation as LumpedThermalModel.step,
+    with constant power over each telemetry interval).  Fast enough for optimiser inner loops."""
+    T = np.empty(len(t))
+    T[0] = Tc = T0
+    for i in range(1, len(t)):
+        a = C / (t[i] - t[i - 1])
+        rhs = P[i] + (Q_ecl if ecl[i] else Q_sun)
+        Tn = Tc
+        for _ in range(60):
+            f = a * (Tn - Tc) - rhs + kr * Tn ** 4
+            step = f / (a + 4.0 * kr * Tn ** 3)
+            Tn -= step
+            if abs(step) < 1e-10:
+                break
+        T[i] = Tc = Tn
+    return T
+
+
+@dataclass
+class ThermalFit:
+    C: float
+    kr: float
+    Q_sun: float
+    Q_ecl: float
+    config_values: Dict[str, float]
+    ci95: Dict[str, Tuple[float, float]]
+    rms_K: float
+    cond: float
+    samples: np.ndarray        # (n, 4): C, kr, Q_sun, Q_ecl
+    fixed: List[str]
+    n_points: int
+    warnings: List[str] = field(default_factory=list)
+
+
+def thermal_to_config_values(cfg: SimConfig, C: float, kr: float, Q_sun: float, Q_ecl: float) -> Tuple[Dict[str, float], List[str]]:
+    tc, w = cfg.thermal, []
+    F_eff = max(0.1, tc.view_factor * (1.0 - tc.degradation_per_year * tc.mission_year))
+    A = kr / (SIGMA_SB * tc.emissivity * F_eff)
+    out = {"capacitance_j_per_k": C, "radiator_area_m2": A}
+    if cfg.orbital.orbit_type == OrbitType.DEEP:
+        out["sun_projected_fraction"] = max(Q_sun / (tc.absorptance * tc.solar_flux_w_m2 * A), 0.0)
+        if out["sun_projected_fraction"] > 1.0:
+            w.append(f"sunlit load implies a projected-area fraction of {out['sun_projected_fraction']:.2f} > 1: telemetry "
+                     f"contains a heat source the model lacks (self-heating, harness, other units)")
+        return out, w
+    Fe = Q_ecl / (tc.emissivity * tc.earth_ir_w_m2 * A)
+    if Fe > 1.0:
+        w.append(f"eclipse load implies Earth view fraction {Fe:.2f} > 1: telemetry contains a heat source the model lacks")
+        Fe = 1.0
+    alb = tc.absorptance * tc.albedo * tc.solar_flux_w_m2 * Fe * tc.albedo_geometry * A
+    fsun = (Q_sun - Q_ecl - alb) / (tc.absorptance * tc.solar_flux_w_m2 * A)
+    if fsun < 0:
+        w.append("sunlit-minus-eclipse load smaller than the albedo term: sun_projected_fraction clamped to 0")
+        fsun = 0.0
+    if fsun > 1.0:
+        w.append(f"sunlit load implies a projected-area fraction of {fsun:.2f} > 1: telemetry contains a heat source the model lacks")
+    out.update(earth_view_fraction=Fe, sun_projected_fraction=fsun)
+    return out, w
+
+
+def fit_thermal_model(samples: Sequence[ThermalSample], cfg: SimConfig, rng: np.random.Generator,
+                      n_draw: int = 500) -> ThermalFit:
+    if len(samples) < 20:
+        raise CalibrationDataError(f"need >= 20 thermal telemetry samples, got {len(samples)}")
+    t = np.array([s.t_s for s in samples]); P = np.array([s.power_w for s in samples])
+    ecl = np.array([s.eclipse for s in samples], bool); Tm = np.array([s.T_k for s in samples])
+    tc = cfg.thermal
+    F_eff = max(0.1, tc.view_factor * (1.0 - tc.degradation_per_year * tc.mission_year))
+    from ..thermal import LumpedThermalModel
+    lm = LumpedThermalModel(cfg)
+    x0 = np.array([tc.capacitance_j_per_k, tc.emissivity * SIGMA_SB * F_eff * tc.radiator_area_m2,
+                   lm.env_load_w(False), lm.env_load_w(True)])
+    names = ["C", "kr", "Q_sun", "Q_ecl"]
+    fixed: List[str] = []
+    warn: List[str] = []
+    has_ecl, has_sun = ecl[1:].any(), (~ecl[1:]).any()
+    if not has_ecl:
+        fixed.append("Q_ecl"); warn.append("no eclipse samples: Q_ecl kept at its placeholder (unresolved)")
+    if not has_sun:
+        fixed.append("Q_sun"); warn.append("no sunlit samples: Q_sun kept at its placeholder (unresolved)")
+    free = [i for i, n in enumerate(names) if n not in fixed]
+
+    lo = np.array([math.log(1.0), math.log(1e-13), 0.0, 0.0]); hi = np.array([math.log(1e7), math.log(1e-6), 5e3, 5e3])
+
+    def full(v):
+        u = np.array([math.log(x0[0]), math.log(x0[1]), x0[2], x0[3]])
+        u[free] = v
+        return u
+
+    def model(v):
+        u = full(v)
+        return integrate_thermal(math.exp(u[0]), math.exp(u[1]), u[2], u[3], t, P, ecl, Tm[0])
+
+    def resid(v):
+        return model(v) - Tm
+
+    best = None
+    base_u = np.array([math.log(x0[0]), math.log(x0[1]), x0[2], x0[3]])
+    for fc in (0.3, 1.0, 3.0):
+        for fk in (0.5, 1.0, 2.0):
+            u0 = base_u.copy(); u0[0] += math.log(fc); u0[1] += math.log(fk)
+            u0[2:] = np.maximum(u0[2:], 1.0)
+            r = least_squares(resid, np.clip(u0[free], lo[free] + 1e-9, hi[free] - 1e-9),
+                              bounds=(lo[free], hi[free]), x_scale="jac")
+            if best is None or r.cost < best.cost:
+                best = r
+    cov_f, sig, w2, cond = _covariance(best, len(Tm) - 1, [names[i] for i in free], (hi - lo)[free])
+    warn += w2
+    u = full(best.x)
+    cov = np.zeros((4, 4)); idx = np.array(free)
+    cov[np.ix_(idx, idx)] = cov_f
+    d = rng.multivariate_normal(u, cov, size=n_draw, check_valid="ignore")
+    d = np.clip(d, lo, hi)
+    samples_nat = np.column_stack([np.exp(d[:, 0]), np.exp(d[:, 1]), d[:, 2], d[:, 3]])
+    C, kr, Qs, Qe = math.exp(u[0]), math.exp(u[1]), float(u[2]), float(u[3])
+    cfgv, w3 = thermal_to_config_values(cfg, C, kr, Qs, Qe)
+    warn += w3
+    keys = list(cfgv)
+    mapped = np.array([[thermal_to_config_values(cfg, *row)[0][k] for k in keys] for row in samples_nat])
+    qlo, qhi = np.percentile(mapped, [2.5, 97.5], axis=0)
+    ci = {k: (float(qlo[i]), float(qhi[i])) for i, k in enumerate(keys)}
+    return ThermalFit(C, kr, Qs, Qe, cfgv, ci, float(np.sqrt(np.mean(best.fun ** 2))), cond,
+                      samples_nat, fixed, len(Tm), warn)
+
+
+def apply_thermal_fit(cfg: SimConfig, fit: ThermalFit, source: str) -> None:
+    for k, v in fit.config_values.items():
+        if (k == "earth_view_fraction" and "Q_ecl" in fit.fixed) or (k == "sun_projected_fraction" and "Q_sun" in fit.fixed):
+            continue
+        setattr(cfg.thermal, k, v)
+        record(cfg, f"thermal.{k}", source=source, method="Newton/backward-Euler trajectory fit + Wald/MVN",
+               status="derived" if k in ("earth_view_fraction", "sun_projected_fraction") else "measured",
+               value=v, ci=fit.ci95[k], note=f"telemetry rms {fit.rms_K:.3f} K, cond {fit.cond:.1e}")
+    record(cfg, "thermal.albedo_geometry", source=source, method="not separable from sun_projected_fraction",
+           status="absorbed", value=cfg.thermal.albedo_geometry, note="sunlit load fitted as a lump; geometry split is nominal")
+
+
+# ===========================================================================
+# Performance (roofline) parameters
+# ===========================================================================
+_DT = {d.label: d for d in DType}
+
+
+@dataclass
+class PerfFit:
+    params: Dict[str, float]
+    ci95: Dict[str, Tuple[float, float]]
+    t_launch_s: float
+    log_rms: float
+    cond: float
+    samples: np.ndarray            # (n, 3): overlap, hbm_efficiency, speedup
+    fixed: List[str]
+    informative: Dict[str, int]
+    n_points: int
+    warnings: List[str] = field(default_factory=list)
+
+
+def _layer(m: PerfMeasurement) -> WorkloadLayer:
+    return WorkloadLayer("m", "gemm", m.M, m.K, m.N, _DT[m.dtype], m.sparsity)
+
+
+def _set(cfg: SimConfig, overlap: float, eff: float, spd: float) -> None:
+    cfg.compute.pipeline_overlap, cfg.memory.hbm_efficiency, cfg.compute.sparse_speedup_at_50 = overlap, eff, spd
+
+
+def regime_counts(meas: Sequence[PerfMeasurement], cfg: SimConfig) -> Dict[str, int]:
+    """How many measurements are informative about each parameter (evaluated under extreme settings)."""
+    c = cfg.copy()
+    n = {"pipeline_overlap": 0, "hbm_efficiency": 0, "sparse_speedup_at_50": 0}
+    for m in meas:
+        L = _layer(m)
+        _set(c, 0.0, 1.0, cfg.compute.sparse_speedup_at_50)
+        a = estimate_layer(L, c, m.freq_ghz)
+        tiles = math.ceil(m.M / c.compute.array_size) * math.ceil(m.N / c.compute.array_size)
+        fill = (2 * c.compute.array_size - 2) * tiles
+        cycles_total = a.t_compute_s * m.freq_ghz * 1e9
+        if tiles > 1 and fill / cycles_total > 0.15 and a.t_memory_s < a.t_compute_s:
+            n["pipeline_overlap"] += 1
+        if a.t_memory_s > 0.3 * a.t_compute_s:
+            n["hbm_efficiency"] += 1
+        if m.sparsity == 0.5 and a.t_memory_s < 0.5 * a.t_compute_s:
+            n["sparse_speedup_at_50"] += 1
+    return n
+
+
+def fit_performance(meas: Sequence[PerfMeasurement], cfg: SimConfig, rng: np.random.Generator,
+                    n_draw: int = 500, min_informative: int = 3) -> PerfFit:
+    if len(meas) < 8:
+        raise CalibrationDataError(f"need >= 8 latency measurements, got {len(meas)}")
+    info = regime_counts(meas, cfg)
+    names = ["pipeline_overlap", "hbm_efficiency", "sparse_speedup_at_50"]
+    cur = [cfg.compute.pipeline_overlap, cfg.memory.hbm_efficiency, cfg.compute.sparse_speedup_at_50]
+    fixed = [n for n in names if info[n] < min_informative]
+    warn = [f"{n}: only {info[n]} informative measurement(s) (< {min_informative}); kept at its placeholder (unresolved)"
+            for n in fixed]
+    free = [i for i, n in enumerate(names) if n not in fixed]
+    lat = np.array([m.latency_s for m in meas])
+    lo = np.array([0.0, 0.05, 1.0, 0.0]); hi = np.array([1.0, 1.0, 2.0, 0.999 * lat.min()])      # launch overhead cannot exceed the fastest measurement
+    c = cfg.copy()
+    layers = [_layer(m) for m in meas]
+
+    def predict(v):
+        p = np.array(cur + [0.0], float)
+        p[free] = v[:len(free)]
+        p[3] = v[-1]
+        _set(c, p[0], p[1], p[2])
+        return np.array([estimate_layer(L, c, m.freq_ghz, exact_cycles=False).duration_s for L, m in zip(layers, meas)]) + p[3]
+
+    def resid(v):
+        return np.log(predict(v)) - np.log(lat)
+
+    def solve(free_):
+        idx_ = free_ + [3]
+        best_ = None
+        for o0 in (0.2, 0.8):
+            for e0 in (0.4, 0.9):
+                for s0 in (1.4, 1.9):
+                    p0 = np.array([o0, e0, s0, 0.1 * lat.min()])
+                    r = least_squares(lambda v: resid_for(free_, v), np.clip(p0[idx_], lo[idx_] + 1e-9, hi[idx_] - 1e-9),
+                                      bounds=(lo[idx_], hi[idx_]), x_scale="jac")
+                    if best_ is None or r.cost < best_.cost:
+                        best_ = r
+        return best_
+
+    def resid_for(free_, v):
+        p = np.array(cur + [0.0], float)
+        p[free_] = v[:len(free_)]
+        p[3] = v[-1]
+        _set(c, p[0], p[1], p[2])
+        pred = np.array([estimate_layer(L, c, m.freq_ghz, exact_cycles=False).duration_s for L, m in zip(layers, meas)]) + p[3]
+        return np.log(pred) - np.log(lat)
+
+    best = solve(free)
+    while True:                       # drop parameters with no sensitivity at the optimum (non-binding regime)
+        cn = np.linalg.norm(best.jac, axis=0) * (hi - lo)[free + [3]]      # sensitivity over the plausible range
+        weak = [free[j] for j in range(len(free)) if cn[j] < 1e-6 * max(cn.max(), 1e-300)]
+        if not weak:
+            break
+        for i_ in weak:
+            fixed.append(names[i_])
+            warn.append(f"{names[i_]}: zero sensitivity at the optimum (that regime is not binding on this chip); "
+                        f"kept at its placeholder (unresolved)")
+        free = [i_ for i_ in free if i_ not in weak]
+        if not free:
+            raise CalibrationDataError("no performance parameter is identifiable from these measurements")
+        best = solve(free)
+    idx = free + [3]
+    cov_f, sig, w2, cond = _covariance(best, len(lat), [names[i] for i in free] + ["t_launch"], (hi - lo)[free + [3]])
+    warn += w2
+    est = np.array(cur + [0.0], float); est[free] = best.x[:len(free)]; est[3] = best.x[-1]
+    cov = np.zeros((4, 4)); ix = np.array(idx); cov[np.ix_(ix, ix)] = cov_f
+    d = np.clip(rng.multivariate_normal(est, cov, size=n_draw, check_valid="ignore"), lo, hi)
+    for j in range(3):
+        if j not in free:
+            d[:, j] = est[j]
+    q = np.percentile(d[:, :3], [2.5, 97.5], axis=0)
+    ci = {n: (float(q[0, i]), float(q[1, i])) for i, n in enumerate(names)}
+    at_bound = [names[i] for i in free if min(est[i] - lo[i], hi[i] - est[i]) < 1e-6]
+    if est[3] > 0.99 * hi[3]:
+        at_bound.append("t_launch")
+    if at_bound:
+        warn.append(f"estimate at a physical bound for {at_bound}: Wald interval invalid for those parameters")
+    if cfg.memory.ecc_enabled:
+        warn.append("hbm_efficiency absorbs the ECC bandwidth overhead (not separable from achieved-bandwidth efficiency)")
+    return PerfFit(dict(zip(names, map(float, est[:3]))), ci, float(est[3]), float(np.sqrt(np.mean(best.fun ** 2))),
+                   cond, d[:, :3], fixed, info, len(lat), warn)
+
+
+def apply_perf_fit(cfg: SimConfig, fit: PerfFit, source: str) -> None:
+    for n, v in fit.params.items():
+        if n in fit.fixed:
+            continue
+        sect = cfg.memory if n == "hbm_efficiency" else cfg.compute
+        setattr(sect, n, v)
+        record(cfg, ("memory." if n == "hbm_efficiency" else "compute.") + n, source=source,
+               method="log-latency least squares + Wald/MVN", value=v, ci=fit.ci95[n],
+               note=f"log rms {fit.log_rms:.3f}, informative points {fit.informative[n]}")
+    if cfg.memory.ecc_enabled and "hbm_efficiency" not in fit.fixed:
+        record(cfg, "memory.ecc_bw_overhead_pct", source=source, method="absorbed into hbm_efficiency", status="absorbed",
+               value=cfg.memory.ecc_bw_overhead_pct)
+
+
+def suggest_gemm_shapes(cfg: SimConfig) -> List[dict]:
+    """Microbenchmark set spanning the regimes the three performance parameters are sensitive to.
+    Check it against YOUR chip with ``design_coverage`` before spending bench time."""
+    A = cfg.compute.array_size
+    out = []
+    for K in (A // 4, A // 2, A):                                  # shallow-K, many tiles -> pipeline_overlap
+        out.append(dict(M=8 * A, K=K, N=8 * A, dtype="int8", sparsity=0.0))
+    for M in (1, 8, 32, 128):                                       # skinny / weight-streaming -> hbm_efficiency
+        out.append(dict(M=M, K=16 * A, N=16 * A, dtype="int8", sparsity=0.0))
+    for K in (32 * A, 96 * A, 160 * A):                             # large, deep, compute-bound dense+sparse pairs
+        for sp in (0.0, 0.5):
+            out.append(dict(M=16 * A, K=K, N=16 * A, dtype="int8", sparsity=sp))
+    for s in (A // 2, A):                                           # tiny: fixed launch overhead
+        out.append(dict(M=s, K=s, N=s, dtype="int8", sparsity=0.0))
+    return out
+
+
+def design_coverage(cfg: SimConfig, shapes: Optional[Sequence[dict]] = None, freq_ghz: Optional[float] = None,
+                    min_informative: int = 3) -> Dict[str, int]:
+    """Number of benchmark shapes informative about each performance parameter on this chip (0 => unidentifiable)."""
+    shapes = list(shapes if shapes is not None else suggest_gemm_shapes(cfg))
+    f = freq_ghz or cfg.dvfs.nom_freq_ghz
+    meas = [PerfMeasurement(s["M"], s["K"], s["N"], s["dtype"], s["sparsity"], f, 1.0) for s in shapes]
+    return regime_counts(meas, cfg)
+```
+
+### `uchu/calibration/workflow.py`
+
+```python
+"""Calibration workflow orchestrator.
+
+    data  --->  [design facts] -> [environment tables] -> [beam: cross-sections] -> [MBU] -> [SEP] -> [power]
+                -> [thermal] -> [performance] -> [AVF] -> [joint epistemic draws + flight reweighting] -> [audit]
+
+Design rules
+  * every step is isolated: bad or insufficient data in one step records a FAILED step and leaves those parameters
+    UNRESOLVED; it never aborts the others and never silently substitutes a guess
+  * every fitted parameter is written to ``cfg.calibration`` (source, method, value, 95 % interval, notes)
+  * epistemic uncertainty is carried as joint parameter draws that can be pushed through the simulator
+    (``sample_configs`` / ``epistemic_mission_study``) -- not left as a table of intervals
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..config import CrossSection, SimConfig
+from ..orbit import FlareSchedule, OrbitalEnvironment
+from ..provenance import provenance
+from ..radiation import RadiationEnvironment
+from ..rng import child_seed, make_rng
+from . import data as D
+from .data import CalibrationData, CalibrationDataError
+from .fit_hardware import (apply_perf_fit, apply_power_fit, apply_thermal_fit, fit_performance, fit_power_model,
+                           fit_thermal_model, thermal_to_config_values)
+from .fit_radiation import (apply_cross_section_fit, apply_mbu_fit, apply_sep_fit, calibrate_avf, expected_events_for_flight,
+                            fit_cross_section, fit_mbu, fit_sep_statistics, flight_update, install_environment_tables,
+                            weighted_quantile)
+from .registry import AuditResult, declare, placeholder_audit, set_by_path
+
+
+@dataclass
+class CalibrationOptions:
+    seed: int = 0
+    n_boot: int = 200
+    n_draws: int = 200
+    flight_discrepancy_log_sigma: float = 0.0
+    min_perf_informative: int = 3
+
+
+@dataclass
+class StepResult:
+    name: str
+    status: str                          # ok | skipped | failed
+    summary: dict = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+def _f(x):
+    return float(x) if isinstance(x, (int, float, np.floating, np.integer)) else x
+
+
+def _ci(c):
+    return [float(c[0]), float(c[1])]
+
+
+# ---------------------------------------------------------------------------
+@dataclass
+class CalibrationReport:
+    config: SimConfig
+    initial_hash: str
+    steps: List[StepResult]
+    audit: AuditResult
+    options: CalibrationOptions
+    fits: Dict[str, object]
+    draws: List[Dict[str, object]]
+    weights: np.ndarray
+    flight: list
+    rate_summary: dict
+    provenance: dict
+
+    # ---- epistemic propagation ------------------------------------------------
+    def config_for_draw(self, j: int) -> SimConfig:
+        c = self.config.copy()
+        for path, val in self.draws[j].items():
+            set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+        return c.validate()
+
+    def sample_configs(self, n: int, rng: np.random.Generator) -> List[SimConfig]:
+        """Configs drawn from the (flight-reweighted) epistemic posterior over all fitted parameters."""
+        idx = rng.choice(len(self.draws), size=n, p=self.weights / self.weights.sum())
+        return [self.config_for_draw(int(j)) for j in idx]
+
+    # ---- serialisation -------------------------------------------------------
+    def to_dict(self) -> dict:
+        return {
+            "provenance": self.provenance, "initial_config_hash": self.initial_hash,
+            "calibrated_config_hash": self.config.config_hash(),
+            "options": vars(self.options),
+            "steps": [vars(s) for s in self.steps],
+            "ledger": self.config.calibration,
+            "audit": {"resolved": sorted(self.audit.resolved), "accepted": sorted(self.audit.accepted),
+                      "unresolved": self.audit.unresolved},
+            "flight": [{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in vars(fu).items() if k != "weights"}
+                       for fu in self.flight],
+            "rate_summary": self.rate_summary,
+        }
+
+    def to_markdown(self) -> str:
+        a = self.audit
+        L = ["# Calibration report", "",
+             f"*model {self.provenance['model_version']} · seed {self.options.seed} · "
+             f"config `{self.initial_hash}` → `{self.config.config_hash()}`*", "",
+             f"**{len(a.resolved)}/{a.n_total} required parameters calibrated or declared · "
+             f"{len(a.accepted)} accepted placeholders · {len(a.unresolved)} UNRESOLVED**", "", "## Steps", "",
+             "| step | status | notes |", "|---|---|---|"]
+        for s in self.steps:
+            note = (s.error or "; ".join(s.warnings[:2]) or "")[:140].replace("|", "/")
+            L.append(f"| {s.name} | {s.status} | {note} |")
+        L += ["", "## Calibrated parameters", "", "| parameter | value | 95 % interval | status | source · method |", "|---|---|---|---|---|"]
+        for p, e in sorted(self.config.calibration.items()):
+            v = e["value"]
+            vs = f"{v:.4g}" if isinstance(v, (int, float)) else str(v)
+            ci = "" if not e["ci95"] else f"[{e['ci95'][0]:.4g}, {e['ci95'][1]:.4g}]"
+            L.append(f"| `{p}` | {vs} | {ci} | {e['status']} | {e['source']} · {e['method']} |")
+        if self.rate_summary:
+            L += ["", "## Predicted per-bit upset rate (orbit-static, per bit per day)", "",
+                  "| region | placeholder | calibrated (95 %) | after flight data (95 %) |", "|---|---|---|---|"]
+            for r, d in self.rate_summary.items():
+                post = d.get("posterior")
+                flag = (f" ⚠ {d['unresolved_fraction']:.0%} rests on placeholder {'/'.join(d['unresolved_kinds'])} cross-section"
+                        if d.get("unresolved_fraction", 0) > 0.05 else "")
+                L.append(f"| {r}{flag} | {d['placeholder']:.3g} | {d['median']:.3g} [{d['lo']:.3g}, {d['hi']:.3g}] | "
+                         + (f"{post['median']:.3g} [{post['lo']:.3g}, {post['hi']:.3g}]" if post else "n/a") + " |")
+        if self.flight:
+            L += ["", "## Flight-data consistency", "", "| log | observed | prior-expected | p(consistent) | posterior multiplier | ESS |", "|---|---|---|---|---|---|"]
+            for f in self.flight:
+                L.append(f"| {f.log} | {f.observed} | {f.expected_prior_mean:.1f} | {f.p_consistency:.3g} | "
+                         f"{f.posterior_multiplier_median:.2f} [{f.posterior_multiplier_ci95[0]:.2f}, {f.posterior_multiplier_ci95[1]:.2f}] | {f.ess:.0f} |")
+        warns = [(s.name, w) for s in self.steps for w in s.warnings]
+        if warns:
+            L += ["", "## Warnings", ""] + [f"- **{n}**: {w}" for n, w in warns]
+        if a.unresolved or a.accepted:
+            L += ["", "## Still placeholders", ""] + [f"- UNRESOLVED `{p}`" for p in a.unresolved] + \
+                 [f"- accepted `{p}` — {e['note']}" for p, e in a.accepted.items()]
+        return "\n".join(L) + "\n"
+
+    def save(self, out_dir) -> Path:
+        out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+        (out / "calibrated_config.json").write_text(self.config.to_json())
+        (out / "calibration_report.json").write_text(json.dumps(self.to_dict(), indent=2, default=str))
+        (out / "calibration_report.md").write_text(self.to_markdown())
+        return out
+
+
+# ---------------------------------------------------------------------------
+def _static_rate_per_bit_day(cfg: SimConfig, region: str) -> float:
+    orbit = OrbitalEnvironment(cfg.orbital)
+    orbit.flares = FlareSchedule.from_events([])
+    return RadiationEnvironment(cfg, orbit).static_rate[region] * 86400.0
+
+
+def run_calibration(cfg: SimConfig, data: CalibrationData, opts: Optional[CalibrationOptions] = None) -> CalibrationReport:
+    opts = opts or CalibrationOptions()
+    initial_hash = cfg.config_hash()
+    placeholder_cfg = cfg.copy()
+    cfg = cfg.copy().validate()
+    steps: List[StepResult] = []
+    fits: Dict[str, object] = {}
+
+    def step(name: str, fn: Callable[[], Tuple[dict, List[str]]], active: bool = True):
+        if not active:
+            steps.append(StepResult(name, "skipped")); return
+        try:
+            summary, warns = fn()
+            steps.append(StepResult(name, "ok", summary, list(warns)))
+        except CalibrationDataError as e:
+            steps.append(StepResult(name, "failed", error=str(e)))
+        except Exception as e:                                           # a bug must not look like a data problem
+            steps.append(StepResult(name, "failed", error=f"INTERNAL {type(e).__name__}: {e}"))
+
+    rng = lambda *k: make_rng(opts.seed, "calib", *k)
+
+    # 1. declared design facts
+    def _facts():
+        for f in data.design_facts:
+            declare(cfg, f.path, f.value, f.source)
+        return {"declared": [f.path for f in data.design_facts]}, []
+    step("design facts", _facts, bool(data.design_facts))
+
+    # 2. environment
+    def _env():
+        w = install_environment_tables(cfg, data.env_tables, data.env_source or "environment tables")
+        return {"components": sorted(data.env_tables)}, w
+    step("environment tables", _env, bool(data.env_tables))
+
+    # 3. beam data
+    for ds in data.beam:
+        def _beam(ds=ds):
+            fit = fit_cross_section(ds, rng("xs", ds.name), n_boot=opts.n_boot)
+            apply_cross_section_fit(cfg, fit)
+            fits[f"xs:{ds.region}:{ds.kind}"] = fit
+            return ({"params": {k: _f(v) for k, v in fit.params.items()},
+                     "ci95": {k: _ci(c) for k, c in fit.ci95.items()}, "deviance_per_dof": _f(fit.dispersion),
+                     "p_value": _f(fit.p_value), "n_events": fit.n_events, "overdispersed": fit.overdispersed}, fit.warnings)
+        step(f"beam: {ds.region}/{ds.kind} ({ds.name})", _beam)
+
+    # 4. MBU
+    def _mbu():
+        fit = fit_mbu(data.mbu, rng("mbu")); apply_mbu_fit(cfg, fit); fits["mbu"] = fit
+        return {"p_mbu": fit.p_mbu, "p_mbu_ci95": _ci(fit.p_mbu_ci95), "geom_p": fit.geom_p,
+                "geom_p_ci95": _ci(fit.geom_p_ci95), "max_cluster": fit.max_cluster, "chi2_p": _f(fit.chi2_p_value)}, fit.warnings
+    step("MBU multiplicity", _mbu, data.mbu is not None)
+
+    # 5. SEP
+    def _sep():
+        fit = fit_sep_statistics(data.sep, rng("sep")); apply_sep_fit(cfg, fit); fits["sep"] = fit
+        return {"n_events": fit.n_events, "rate_per_year": fit.rate_per_year, "rate_ci95": _ci(fit.rate_ci95),
+                "median_intensity": fit.median_intensity, "log_sigma": fit.log_sigma}, fit.warnings
+    step("SEP statistics", _sep, data.sep is not None)
+
+    # 6-8. hardware
+    def _power():
+        fit = fit_power_model(data.power, cfg, rng("power")); apply_power_fit(cfg, fit, data.power_source); fits["power"] = fit
+        return {"values": fit.config_values, "ci95": {k: _ci(v) for k, v in fit.ci95.items()},
+                "rel_rms": fit.rel_rms_error, "cond": fit.cond}, fit.warnings
+    step("power model", _power, bool(data.power))
+
+    def _thermal():
+        fit = fit_thermal_model(data.thermal, cfg, rng("thermal")); apply_thermal_fit(cfg, fit, data.thermal_source); fits["thermal"] = fit
+        return {"values": fit.config_values, "ci95": {k: _ci(v) for k, v in fit.ci95.items()},
+                "rms_K": fit.rms_K, "cond": fit.cond, "fixed": fit.fixed}, fit.warnings
+    step("thermal model", _thermal, bool(data.thermal))
+
+    def _perf():
+        fit = fit_performance(data.perf, cfg, rng("perf"), min_informative=opts.min_perf_informative)
+        apply_perf_fit(cfg, fit, data.perf_source); fits["perf"] = fit
+        return {"params": fit.params, "ci95": {k: _ci(v) for k, v in fit.ci95.items()}, "t_launch_s": fit.t_launch_s,
+                "unresolved": fit.fixed, "informative": fit.informative, "log_rms": fit.log_rms}, fit.warnings
+    step("performance", _perf, bool(data.perf))
+
+    # 9. AVF
+    for req in data.avf:
+        def _avf(req=req):
+            r = calibrate_avf(cfg, req.field, req.dtype, req.tol, req.trials_per_bit, req.shape, seed=opts.seed)
+            return {"avf": r.avf, "ci95": [r.ci_low, r.ci_high], "used": getattr(cfg.radiation, req.field)}, []
+        step(f"AVF ({req.field}, {req.dtype}, tol={req.tol})", _avf)
+
+    # 10. joint epistemic draws, flight reweighting
+    draws: List[Dict[str, object]] = []
+    weights = np.ones(opts.n_draws)
+    flight_updates: list = []
+    rate_summary: dict = {}
+
+    def _draws():
+        nonlocal weights
+        r = rng("draws")
+        for _ in range(opts.n_draws):
+            a: Dict[str, object] = {}
+            for key, fit in fits.items():
+                if key.startswith("xs:"):
+                    _, region, kind = key.split(":")
+                    a[f"radiation.{region}.{kind}"] = fit.draw(int(r.integers(len(fit.samples))))
+                elif key == "mbu":
+                    i = int(r.integers(len(fit.p_samples)))
+                    a.update({"radiation.mbu_prob": float(fit.p_samples[i]), "radiation.mbu_cluster_geom_p": float(max(fit.q_samples[i], 1e-3))})
+                elif key == "sep":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    a.update({"orbital.sep_events_per_year": float(s[0]), "orbital.sep_mean_duration_s": float(s[1]),
+                              "orbital.sep_intensity_median": float(s[2]), "orbital.sep_intensity_log_sigma": float(s[3])})
+                elif key == "power":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    a.update({"power.base_power_w": float(s[0]), "power.static_frac": float(s[1]),
+                              "power.leak_temp_coeff": float(s[2]), "power.clock_frac": float(s[3])})
+                elif key == "thermal":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    vals, _ = thermal_to_config_values(cfg, *s)
+                    for k, v in vals.items():
+                        if not (k == "earth_view_fraction" and "Q_ecl" in fit.fixed) and not (k == "sun_projected_fraction" and "Q_sun" in fit.fixed):
+                            a[f"thermal.{k}"] = float(v)
+                elif key == "perf":
+                    s = fit.samples[int(r.integers(len(fit.samples)))]
+                    for n, v in zip(("compute.pipeline_overlap", "memory.hbm_efficiency", "compute.sparse_speedup_at_50"), s):
+                        a[n] = float(v)
+            draws.append(a)
+        return {"n_draws": len(draws), "sources": sorted(fits)}, []
+    step("epistemic draws", _draws, bool(fits))
+
+    report_cfg = cfg   # best-estimate config
+
+    def _flight():
+        nonlocal weights
+        wts = np.ones(len(draws))
+        cfgs = []
+        for a in draws:
+            c = report_cfg.copy()
+            for path, val in a.items():
+                set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+            cfgs.append(c)
+        warns: List[str] = []
+        for log in data.flight:
+            E = np.array([expected_events_for_flight(c, log.region, log.n_units, log.segments, log.flare_events) for c in cfgs])
+            fu = flight_update(E, log.events, opts.flight_discrepancy_log_sigma, log=log.name)
+            flight_updates.append(fu); warns += [f"{log.name}: {w}" for w in fu.warnings]
+            wts = wts * fu.weights
+        weights = wts / wts.sum()
+        return {"logs": [f.log for f in flight_updates],
+                "combined_ess": float(1.0 / np.sum(weights ** 2))}, warns
+    step("flight-data update", _flight, bool(data.flight) and bool(draws))
+
+    # rate summary (SRAM, plus any region with a fitted ion cross-section)
+    if draws:
+        regions = sorted({k.split(":")[1] for k in fits if k.startswith("xs:")})
+        for region in regions:
+            vals = np.array([_static_rate_per_bit_day(
+                _apply(report_cfg, a), region) for a in draws])
+            lo, med, hi = weighted_quantile(vals, np.ones(len(vals)), [0.025, 0.5, 0.975])
+            d = {"placeholder": _static_rate_per_bit_day(_with_env(placeholder_cfg, cfg), region),
+                 "median": float(med), "lo": float(lo), "hi": float(hi)}
+            if flight_updates:
+                lo2, med2, hi2 = weighted_quantile(vals, weights, [0.025, 0.5, 0.975])
+                d["posterior"] = {"median": float(med2), "lo": float(lo2), "hi": float(hi2)}
+            d.update(_placeholder_dependence(report_cfg, region))
+            rate_summary[region] = d
+
+    audit = placeholder_audit(cfg)
+    return CalibrationReport(cfg, initial_hash, steps, audit, opts, fits, draws, weights, flight_updates, rate_summary,
+                             provenance(cfg, opts.seed))
+
+
+def _placeholder_dependence(cfg: SimConfig, region: str) -> dict:
+    """What share of this region's orbit-static rate is carried by cross-section families that are STILL placeholders?
+    The reported interval does not include their uncertainty, so a high share means the interval is not trustworthy."""
+    orbit = OrbitalEnvironment(cfg.orbital)
+    orbit.flares = FlareSchedule.from_events([])
+    env = RadiationEnvironment(cfg, orbit)
+    sc, comp = env.scalars, env.base[region]
+    part = {"ion": comp["gcr"] * sc["geo"] * sc["solar_gcr"], "proton": comp["trapped"] * sc["trapped"] * sc["proton_shield"]}
+    unresolved = [k for k in ("ion", "proton")
+                  if getattr(getattr(cfg.radiation, region), k).sigma_sat_cm2 > 0 and
+                  any(f"radiation.{region}.{k}.{p}" not in cfg.calibration for p in ("sigma_sat_cm2", "x_th", "width", "shape"))]
+    total = sum(part.values())
+    frac = sum(part[k] for k in unresolved) / total if total > 0 else 0.0
+    return {"unresolved_kinds": unresolved, "unresolved_fraction": float(frac)}
+
+
+def _apply(cfg: SimConfig, assign: Dict[str, object]) -> SimConfig:
+    c = cfg.copy()
+    for path, val in assign.items():
+        set_by_path(c, path, CrossSection(**vars(val)) if isinstance(val, CrossSection) else val)
+    return c
+
+
+def _with_env(placeholder_cfg: SimConfig, calibrated: SimConfig) -> SimConfig:
+    """Placeholder cross-sections evaluated in the calibrated environment (isolates the effect of the beam data)."""
+    c = placeholder_cfg.copy()
+    c.radiation.environment_mode = calibrated.radiation.environment_mode
+    c.radiation.tables = {k: type(v)(list(v.x), list(v.phi_integral)) for k, v in calibrated.radiation.tables.items()}
+    return c
+
+
+# ---------------------------------------------------------------------------
+def epistemic_mission_study(report: CalibrationReport, layers, mission_s: float, n: int = 16, duty: float = 1.0,
+                            dt_max_s: float = 30.0, seed: int = 0) -> Dict[str, np.ndarray]:
+    """Push epistemic parameter draws through the simulator: spread of mission outputs due to calibration uncertainty."""
+    from ..simulator import run_mission
+    cfgs = report.sample_configs(n, make_rng(seed, "epistemic"))
+    out = {k: [] for k in ("T_max_k", "avg_tflops", "avg_power_w", "sdc_per_hr", "seu_sram")}
+    for i, c in enumerate(cfgs):
+        r = run_mission(c, layers, mission_s, duty, dt_max_s, seed=child_seed(seed, "epi", i))
+        out["T_max_k"].append(r.T_max_k); out["avg_tflops"].append(r.avg_tflops_dense)
+        out["avg_power_w"].append(r.avg_power_w); out["sdc_per_hr"].append(r.radiation.sdc_per_hr)
+        out["seu_sram"].append(r.radiation.n_seu_sram)
+    return {k: np.array(v) for k, v in out.items()}
+
+
+# ---------------------------------------------------------------------------
+# Plan files / CLI
+# ---------------------------------------------------------------------------
+def load_plan(path) -> Tuple[SimConfig, CalibrationData, CalibrationOptions]:
+    path = Path(path)
+    plan = json.loads(path.read_text())
+    base = path.parent
+    cfg = SimConfig.from_json((base / plan["base_config"]).read_text()) if plan.get("base_config") else SimConfig()
+    data = CalibrationData()
+    env = plan.get("environment")
+    if env:
+        data.env_tables = {k: D.load_spectrum_csv(base / f) for k, f in env["tables"].items()}
+        data.env_source = env.get("source", "environment tables")
+    for b in plan.get("beam", []):
+        data.beam.append(D.load_beam_csv(base / b["file"], b["region"], b["kind"], b.get("name")))
+    if "mbu" in plan:
+        data.mbu = D.load_mbu_csv(base / plan["mbu"]["file"])
+    if "sep" in plan:
+        data.sep = D.load_sep_csv(base / plan["sep"]["file"], plan["sep"]["obs_span_s"])
+    if "power" in plan:
+        data.power = D.load_power_csv(base / plan["power"]["file"]); data.power_source = plan["power"].get("source", "power measurements")
+    if "thermal" in plan:
+        data.thermal = D.load_thermal_csv(base / plan["thermal"]["file"]); data.thermal_source = plan["thermal"].get("source", "thermal telemetry")
+    if "perf" in plan:
+        data.perf = D.load_perf_csv(base / plan["perf"]["file"]); data.perf_source = plan["perf"].get("source", "performance microbenchmarks")
+    for f in plan.get("flight", []):
+        data.flight.append(D.FlightLog(f["name"], f["region"], f["n_units"], tuple(map(tuple, f["segments"])), int(f["events"]),
+                                       tuple(map(tuple, f.get("flare_events", [])))))
+    for a in plan.get("avf", []):
+        data.avf.append(D.AvfRequest(**{**a, "shape": tuple(a.get("shape", (32, 32, 32)))}))
+    for d in plan.get("design_facts", []):
+        data.design_facts.append(D.DesignFact(d["path"], d["value"], d["source"]))
+    return cfg, data, CalibrationOptions(**plan.get("options", {}))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m uchu.calibration", description="Run the Uchu Gijutsu calibration workflow.")
+    ap.add_argument("plan", help="calibration plan (JSON)")
+    ap.add_argument("--out", default="calibration_out", help="output directory")
+    args = ap.parse_args(argv)
+    t0 = time.time()
+    try:
+        cfg, data, opts = load_plan(args.plan)
+    except (CalibrationDataError, OSError, KeyError, ValueError) as e:
+        print(f"PLAN ERROR: {e}", file=sys.stderr)
+        return 3
+    rep = run_calibration(cfg, data, opts)
+    out = rep.save(args.out)
+    print(rep.audit.render())
+    for s in rep.steps:
+        print(f"  [{s.status:7s}] {s.name}" + (f"  -- {s.error}" if s.error else ""))
+    print(f"wrote {out}/ in {time.time() - t0:.1f}s")
+    return 2 if any(s.status == "failed" for s in rep.steps) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### `uchu/calibration/synthetic.py`
+
+```python
+"""Synthetic measurement campaigns generated from a hidden TRUTH configuration.
+
+Purpose: prove the workflow can recover known parameters (and quantify when it cannot) before it is pointed at real data.
+Synthetic data are generated by the SAME models the calibration fits, so a pass demonstrates the fitting machinery
+(estimator, uncertainty, identifiability handling) -- it does not demonstrate that the models describe real hardware.
+"""
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..config import CrossSection, DType, SimConfig, SpectrumTable
+from ..memory import WorkloadLayer, estimate_layer
+from ..orbit import FlareSchedule, OrbitalEnvironment
+from ..radiation import RadiationEnvironment, TruncatedPowerLaw
+from ..thermal import LumpedThermalModel
+from .data import (BeamDataset, BeamPoint, FlightLog, MbuDataset, PerfMeasurement, PowerMeasurement, SepCatalog,
+                   ThermalSample)
+from .fit_hardware import suggest_gemm_shapes, suggest_power_design
+from .fit_radiation import _cluster_pmf, expected_events_for_flight
+
+
+def bake_environment_tables(cfg: SimConfig, n: int = 1500) -> SimConfig:
+    """Convert a 'scaled_placeholder' config into an equivalent 'tabulated_orbit' config (placeholder scalings baked into
+    the tables).  Also the migration path for anyone holding v3.0 power-law configs."""
+    c = cfg.copy()
+    rc = c.radiation
+    env = RadiationEnvironment(c, OrbitalEnvironment(c.orbital))
+    sc = env.scalars
+    plan = {"gcr_ion": (rc.gcr_ion, rc.let_grid_lo, sc["geo"] * sc["solar_gcr"]),
+            "trapped_proton": (rc.trapped_proton, rc.energy_grid_lo, sc["trapped"] * sc["proton_shield"]),
+            "sep_ion": (rc.sep_ion, rc.let_grid_lo, sc["geo"]),
+            "sep_proton": (rc.sep_proton, rc.energy_grid_lo, sc["proton_shield"] * sc["geo"])}
+    tables: Dict[str, SpectrumTable] = {}
+    for key, (sp, lo, scale) in plan.items():
+        if scale <= 0:
+            continue
+        law = TruncatedPowerLaw(sp.phi_ref, sp.x_ref, sp.gamma, sp.x_max)
+        x = np.geomspace(lo, sp.x_max, n)
+        tables[key] = SpectrumTable(x.tolist(), (law.integral(x) * scale).tolist())
+    rc.tables = tables
+    rc.environment_mode = "tabulated_orbit"
+    return c.validate()
+
+
+def make_truth_config() -> SimConfig:
+    """A deliberately non-default 'real device': every placeholder family differs from the shipped default."""
+    c = bake_environment_tables(SimConfig())
+    r = c.radiation
+    r.sram.ion = CrossSection(3.2e-14, 1.2, 14.0, 1.7)
+    r.sram.proton = CrossSection(1.5e-14, 20.0, 35.0, 1.5)       # ~3x the placeholder proton sensitivity
+    r.register.ion = CrossSection(5.5e-14, 0.9, 10.0, 1.5)
+    r.mbu_prob, r.mbu_cluster_geom_p, r.mbu_max_cluster = 0.18, 0.45, 5
+    c.orbital.sep_events_per_year, c.orbital.sep_mean_duration_s = 4.2, 30 * 3600.0
+    c.orbital.sep_intensity_median, c.orbital.sep_intensity_log_sigma = 0.8, 1.3
+    c.power.base_power_w, c.power.static_frac, c.power.leak_temp_coeff, c.power.clock_frac = 63.0, 0.38, 3.1, 0.12
+    c.thermal.capacitance_j_per_k, c.thermal.radiator_area_m2 = 320.0, 0.21
+    c.thermal.earth_view_fraction, c.thermal.sun_projected_fraction = 0.32, 0.22
+    c.memory.hbm_bw_tb_s_per_stack = 0.15           # datasheet value (known to the analyst too)
+    c.memory.hbm_efficiency, c.compute.pipeline_overlap, c.compute.sparse_speedup_at_50 = 0.72, 0.6, 1.7
+    return c.validate()
+
+
+def analyst_start_config(truth: SimConfig) -> SimConfig:
+    """What the analyst has before calibrating: datasheet facts and the orbit, but default placeholders everywhere else."""
+    c = SimConfig()
+    c.orbital = truth.orbital.__class__(**{**vars(truth.orbital)})
+    c.orbital.sep_events_per_year = None
+    c.orbital.sep_mean_duration_s, c.orbital.sep_intensity_median, c.orbital.sep_intensity_log_sigma = 12 * 3600.0, 1.0, 1.0
+    c.memory.hbm_bw_tb_s_per_stack = truth.memory.hbm_bw_tb_s_per_stack
+    return c.validate()
+
+
+# ---------------------------------------------------------------------------
+def gen_beam(truth: CrossSection, region: str, kind: str, name: str, rng: np.random.Generator, n_units: float,
+             x_grid: Sequence[float], target_events: float = 150.0, f_min: float = 1e5, f_max: float = 1e8) -> BeamDataset:
+    """Beam runs the way they are done: run each point to ~target_events or until fluence f_max."""
+    pts = []
+    for x in x_grid:
+        sig = float(truth(x))
+        F = f_max if sig <= 0 else float(np.clip(target_events / (sig * n_units), f_min, f_max))
+        pts.append(BeamPoint(float(x), F, int(rng.poisson(sig * n_units * F)), float(n_units)))
+    return BeamDataset(name, region, kind, tuple(pts))
+
+
+def gen_mbu(truth: SimConfig, n_strikes: int, rng: np.random.Generator, name: str = "mbu") -> MbuDataset:
+    r = truth.radiation
+    pmf = np.concatenate([[1 - r.mbu_prob], r.mbu_prob * _cluster_pmf(r.mbu_cluster_geom_p, r.mbu_max_cluster)])
+    sizes = rng.choice(np.arange(1, r.mbu_max_cluster + 1), size=n_strikes, p=pmf)
+    return MbuDataset(name, {int(m): int((sizes == m).sum()) for m in np.unique(sizes)})
+
+
+def gen_sep_catalog(truth: SimConfig, years: float, rng: np.random.Generator, name: str = "sep") -> SepCatalog:
+    o = truth.orbital
+    n = int(rng.poisson(o.sep_events_per_year * years))
+    return SepCatalog(name, years * 365.25 * 86400.0, tuple(rng.exponential(o.sep_mean_duration_s, n)),
+                      tuple(rng.lognormal(math.log(o.sep_intensity_median), o.sep_intensity_log_sigma, n)))
+
+
+def gen_power(truth: SimConfig, rng: np.random.Generator, rel_noise: float = 0.01) -> List[PowerMeasurement]:
+    from ..thermal import PowerModel as PM
+    pm, out = PM(truth), []
+    for d in suggest_power_design():
+        f, v = truth.dvfs.nom_freq_ghz * d["f_frac"], truth.dvfs.nom_voltage_v * d["v_frac"]
+        out.append(PowerMeasurement(d["T_k"], f, v, d["util"], pm.power_w(d["T_k"], f, v, d["util"]) * (1 + rng.normal(0, rel_noise))))
+    return out
+
+
+def gen_thermal(truth: SimConfig, rng: np.random.Generator, n_orbits: int = 3, dt: float = 30.0, noise_K: float = 0.3,
+                T0: float = 285.0) -> List[ThermalSample]:
+    orb, th = OrbitalEnvironment(truth.orbital), LumpedThermalModel(truth)
+    th.T = T0
+    rows = [ThermalSample(0.0, 0.0, False, T0)]
+    for i in range(1, int(n_orbits * orb.period_s / dt) + 1):
+        t1 = i * dt
+        P = 35.0 + 25.0 * (0.5 + 0.5 * math.sin(2 * math.pi * t1 / 1900.0))
+        ecl = orb.in_eclipse(t1)
+        th.step(dt, lambda T, P=P: P, ecl)
+        rows.append(ThermalSample(t1, P, ecl, th.T + rng.normal(0, noise_K)))
+    return rows
+
+
+def gen_perf(truth: SimConfig, start: SimConfig, rng: np.random.Generator, t_launch: float = 8e-6, log_noise: float = 0.02,
+             freqs: Sequence[float] = (1.0, 1.5), shapes: Optional[Sequence[dict]] = None) -> List[PerfMeasurement]:
+    dt = {d.label: d for d in DType}
+    out = []
+    for s in (shapes if shapes is not None else suggest_gemm_shapes(start)):
+        for f in freqs:
+            L = WorkloadLayer("m", "g", s["M"], s["K"], s["N"], dt[s["dtype"]], s["sparsity"])
+            lat = (estimate_layer(L, truth, f).duration_s + t_launch) * math.exp(rng.normal(0, log_noise))
+            out.append(PerfMeasurement(s["M"], s["K"], s["N"], s["dtype"], s["sparsity"], f, lat))
+    return out
+
+
+def gen_flight(truth: SimConfig, region: str, n_units: float, years: float, rng: np.random.Generator,
+               name: str = "flight", gap_fraction: float = 0.1) -> FlightLog:
+    """On-orbit EDAC log: monitored for `years` with a few outage gaps; flares from a (known) SEP catalogue."""
+    span = years * 365.25 * 86400.0
+    sched = FlareSchedule(truth.orbital.sep_events_per_year / (365.25 * 86400.0), rng,
+                          truth.orbital.sep_mean_duration_s, truth.orbital.sep_intensity_log_sigma,
+                          truth.orbital.sep_intensity_median)
+    sched.extend_to(span)
+    flares = tuple(e for e in sched.events if e[0] < span)
+    cut = rng.uniform(0.3, 0.7) * span
+    gap = gap_fraction * span
+    segs = ((0.0, cut), (cut + gap, span))
+    E = expected_events_for_flight(truth, region, n_units, segs, flares)
+    return FlightLog(name, region, n_units, segs, int(rng.poisson(E)), flares)
+
+
+# ---------------------------------------------------------------------------
+def write_campaign(out_dir, truth: SimConfig, start: SimConfig, rng: np.random.Generator) -> Path:
+    """Write a complete on-disk campaign (CSV files + plan.json) so the CLI path is exercised end to end."""
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    import csv
+
+    def w(name, header, rows):
+        with open(out / name, "w", newline="") as fh:
+            cw = csv.writer(fh); cw.writerow(header); cw.writerows(rows)
+
+    for k, t in truth.radiation.tables.items():
+        w(f"env_{k}.csv", ["x", "phi_integral"], zip(t.x, t.phi_integral))
+    nb = 1e8
+    plan: dict = {"base_config": "start_config.json", "options": {"seed": 7, "n_boot": 80, "n_draws": 80},
+                  "environment": {"source": "synthetic CREME-like tables", "tables": {k: f"env_{k}.csv" for k in truth.radiation.tables}},
+                  "beam": [], "design_facts": [{"path": "radiation.gates_per_pe", "value": 1800, "source": "synthetic netlist"}]}
+    ion_x = [1.5, 2.2, 3.3, 5.0, 7.5, 11.0, 17.0, 26.0, 40.0, 60.0, 85.0]
+    pro_x = [12.0, 18.0, 25.0, 35.0, 50.0, 70.0, 100.0, 150.0, 200.0]
+    for region, kind in (("sram", "ion"), ("sram", "proton"), ("register", "ion")):
+        xs = getattr(getattr(truth.radiation, region), kind)
+        ds = gen_beam(xs, region, kind, f"{region}_{kind}", rng, nb if region == "sram" else 1.2e7, ion_x if kind == "ion" else pro_x)
+        col = "let_mev_cm2_mg" if kind == "ion" else "energy_mev"
+        w(f"beam_{region}_{kind}.csv", [col, "fluence_cm2", "events", "n_units"],
+          [(p.x, p.fluence_cm2, p.events, p.n_units) for p in ds.points])
+        plan["beam"].append({"file": f"beam_{region}_{kind}.csv", "region": region, "kind": kind, "name": f"{region}_{kind}"})
+    m = gen_mbu(truth, 600, rng)
+    w("mbu.csv", ["cluster_size", "count"], sorted(m.counts.items())); plan["mbu"] = {"file": "mbu.csv"}
+    s = gen_sep_catalog(truth, 25.0, rng)
+    w("sep.csv", ["duration_s", "intensity_rel"], zip(s.durations_s, s.intensities_rel))
+    plan["sep"] = {"file": "sep.csv", "obs_span_s": s.obs_span_s}
+    w("power.csv", ["T_k", "f_ghz", "v_v", "util", "power_w"], [(p.T_k, p.f_ghz, p.v_v, p.util, p.power_w) for p in gen_power(truth, rng)])
+    plan["power"] = {"file": "power.csv", "source": "synthetic bench sweep"}
+    w("thermal.csv", ["t_s", "power_w", "eclipse", "T_k"], [(r.t_s, r.power_w, int(r.eclipse), r.T_k) for r in gen_thermal(truth, rng)])
+    plan["thermal"] = {"file": "thermal.csv", "source": "synthetic flight-like telemetry"}
+    w("perf.csv", ["M", "K", "N", "dtype", "sparsity", "freq_ghz", "latency_s"],
+      [(p.M, p.K, p.N, p.dtype, p.sparsity, p.freq_ghz, p.latency_s) for p in gen_perf(truth, start, rng)])
+    plan["perf"] = {"file": "perf.csv", "source": "synthetic microbenchmarks"}
+    fl = gen_flight(truth, "sram", 5.4e8, 2.0, rng)
+    plan["flight"] = [{"name": fl.name, "region": fl.region, "n_units": fl.n_units, "segments": [list(x) for x in fl.segments],
+                       "events": fl.events, "flare_events": [list(x) for x in fl.flare_events]}]
+    plan["avf"] = [{"field": "avf_sram", "dtype": "int8", "tol": 0.01, "trials_per_bit": 40}]
+    (out / "start_config.json").write_text(start.to_json())
+    (out / "plan.json").write_text(json.dumps(plan, indent=2))
+    return out / "plan.json"
+```
+
+---
+
+## 9. Tests
+
+### `tests/__init__.py`
+
+```python
+"""Test package (enables `from tests._campaign import ...`)."""
+```
+
+### `tests/_campaign.py`
+
+```python
+"""Shared builder for synthetic calibration campaigns (hidden truth -> measurements)."""
+from uchu import make_rng
+from uchu.calibration import CalibrationData
+from uchu.calibration.data import AvfRequest, DesignFact
+from uchu.calibration.synthetic import (gen_beam, gen_flight, gen_mbu, gen_perf, gen_power, gen_sep_catalog, gen_thermal,
+                                        analyst_start_config, make_truth_config)
+
+ION_X = [1.5, 2.2, 3.3, 5.0, 7.5, 11.0, 17.0, 26.0, 40.0, 60.0, 85.0]
+PRO_X = [12., 18., 25., 35., 50., 70., 100., 150., 200.]
+TRUTH = make_truth_config()
+START = analyst_start_config(TRUTH)
+
+
+def build(seed, truth=TRUTH, start=START, *, flight=True, hardware=True, mbu=True, sep=True, register=True, avf=True,
+          n_mbu=600, sep_years=25.0, flight_years=2.0):
+    rng = make_rng(seed, "e2e")
+    d = CalibrationData(env_tables=truth.radiation.tables, env_source="synthetic CREME tables")
+    d.beam = [gen_beam(truth.radiation.sram.ion, "sram", "ion", "sram_ion", rng, 1e8, ION_X),
+              gen_beam(truth.radiation.sram.proton, "sram", "proton", "sram_proton", rng, 1e8, PRO_X)]
+    if register:
+        d.beam.append(gen_beam(truth.radiation.register.ion, "register", "ion", "reg_ion", rng, 1.2e7, ION_X))
+    if mbu:
+        d.mbu = gen_mbu(truth, n_mbu, rng)
+    if sep:
+        d.sep = gen_sep_catalog(truth, sep_years, rng)
+    if hardware:
+        d.power, d.thermal, d.perf = gen_power(truth, rng), gen_thermal(truth, rng), gen_perf(truth, start, rng)
+    if flight:
+        d.flight = [gen_flight(truth, "sram", 5.4e8, flight_years, rng)]
+    if avf:
+        d.avf = [AvfRequest("avf_sram", "int8", 1e-2, 40)]
+    d.design_facts = [DesignFact("radiation.gates_per_pe", 1800, "synthetic netlist")]
+    return d
+```
+
+### `tests/test_rng_config.py`
+
+```python
+import numpy as np
+import pytest
+
+from uchu import SimConfig, make_rng, child_seed, provenance
+from uchu.config import DType, ProcessNode
+from uchu.stats import poisson_rate_ci, wilson_ci
+
+
+def test_same_keys_same_stream_different_keys_differ():
+    a = make_rng(1, "x").random(5)
+    assert np.array_equal(a, make_rng(1, "x").random(5))
+    assert not np.array_equal(a, make_rng(1, "y").random(5))
+    assert not np.array_equal(a, make_rng(2, "x").random(5))
+
+
+def test_child_seed_deterministic_and_distinct():
+    assert child_seed(7, "s", 1) == child_seed(7, "s", 1)
+    assert len({child_seed(7, "s", i) for i in range(1000)}) == 1000
+
+
+def test_global_rng_untouched():
+    np.random.seed(123)
+    before = np.random.get_state()[1].copy()
+    make_rng(5, "a").random(100)
+    assert np.array_equal(before, np.random.get_state()[1])
+
+
+def test_default_config_validates_and_hash_is_stable():
+    c = SimConfig().validate()
+    assert c.config_hash() == SimConfig().config_hash()
+    c2 = c.copy(); c2.compute.array_size = 128
+    assert c2.config_hash() != c.config_hash()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: setattr(c.compute, "array_size", 0),
+    lambda c: setattr(c.power, "static_frac", 1.0),
+    lambda c: setattr(c.dvfs, "nom_voltage_v", 2.0),
+    lambda c: setattr(c.radiation, "mbu_prob", 1.5),
+    lambda c: setattr(c.radiation, "scrub_interval_s", 0.0),
+    lambda c: setattr(c.thermal, "capacitance_j_per_k", -1.0),
+])
+def test_invalid_configs_rejected(mutate):
+    c = SimConfig(); mutate(c)
+    with pytest.raises(ValueError):
+        c.validate()
+
+
+def test_dtype_throughput_is_not_inverted():
+    assert DType.INT4.pe_throughput > DType.INT8.pe_throughput > DType.FP16.pe_throughput > DType.FP32.pe_throughput
+
+
+def test_provenance_fields():
+    p = provenance(SimConfig())
+    assert {"model_version", "config_hash", "seed", "numpy", "scipy"} <= set(p)
+
+
+def test_poisson_ci_covers_and_zero_case():
+    lo, hi = poisson_rate_ci(0, 10.0)
+    assert lo == 0.0 and 0.365 < hi < 0.373         # 3.689/10 (exact Garwood)
+    lo, hi = poisson_rate_ci(100, 1.0)
+    assert lo < 100 < hi
+
+
+def test_poisson_ci_coverage_monte_carlo():
+    rng = make_rng(0, "cov")
+    lam, n, cover = 7.3, 4000, 0
+    for k in rng.poisson(lam, size=n):
+        lo, hi = poisson_rate_ci(int(k), 1.0)
+        cover += lo <= lam <= hi
+    assert cover / n >= 0.94          # exact interval is conservative (>= nominal 95%)
+
+
+def test_wilson_ci_basic():
+    lo, hi = wilson_ci(50, 100)
+    assert 0.40 < lo < 0.5 < hi < 0.60
+
+
+def test_bootstrap_ci_brackets_mean_and_shrinks_with_n():
+    from uchu.stats import bootstrap_ci
+    rng = make_rng(0, "b")
+    small, large = rng.normal(5.0, 2.0, 30), rng.normal(5.0, 2.0, 3000)
+    lo, hi = bootstrap_ci(small, rng=make_rng(1, "bb"))
+    assert lo < small.mean() < hi
+    lo2, hi2 = bootstrap_ci(large, n_boot=500, rng=make_rng(1, "bb"))
+    assert (hi2 - lo2) < 0.3 * (hi - lo) and lo2 < 5.0 < hi2
+```
+
+### `tests/test_memory.py`
+
+```python
+import math
+
+import pytest
+
+from uchu import DType, SimConfig, WorkloadLayer, estimate_layer, structured_sparsity_speedup
+from uchu.memory import hbm_bandwidth_bytes_s, profile_pass, weight_bytes_factor
+
+F = 1.5
+
+
+def cfg(**kw):
+    c = SimConfig()
+    for k, v in kw.items():
+        setattr(c.compute if k in ("array_size", "pipeline_overlap") else c.memory, k, v)
+    return c.validate()
+
+
+def test_cycle_count_exact_single_tile():
+    c = cfg(array_size=64)
+    l = WorkloadLayer("t", "linear", 64, 128, 64, DType.INT8)
+    p = estimate_layer(l, c, F)
+    assert p.t_compute_s == pytest.approx((128 + 2 * 64 - 2) / (F * 1e9))
+
+
+def test_tiling_quantisation_penalty():
+    c = cfg(array_size=64)
+    a = estimate_layer(WorkloadLayer("a", "linear", 64, 4096, 64), c, F)
+    b = estimate_layer(WorkloadLayer("b", "linear", 65, 4096, 64), c, F)   # 2 row-tiles for 1 extra row
+    assert b.t_compute_s == pytest.approx(2 * a.t_compute_s)
+    assert b.util < 0.55 * a.util + 1e-9 or b.util < a.util * 0.6
+
+
+def test_peak_matches_closed_form():
+    c = cfg()
+    p = estimate_layer(WorkloadLayer("t", "linear", 4096, 4096, 4096), c, F)
+    assert p.peak_exec_tflops == pytest.approx(2 * 256 * 256 * F * 1e9 / 1e12)
+
+
+def test_large_gemm_is_compute_bound_and_near_peak():
+    c = cfg()
+    p = estimate_layer(WorkloadLayer("t", "linear", 8192, 8192, 8192), c, F)
+    assert not p.memory_bound
+    assert p.util > 0.9
+
+
+def test_gemv_on_output_stationary_array_is_compute_limited_by_idle_rows():
+    """M=1 uses 1 of 256 PE rows: the array, not HBM, is the bottleneck at default bandwidth."""
+    p = estimate_layer(WorkloadLayer("gemv", "linear", 1, 8192, 8192), cfg(), F)
+    assert not p.memory_bound and p.util < 0.01
+
+
+def test_memory_bound_when_bandwidth_is_scarce():
+    slow = cfg(hbm_bw_tb_s_per_stack=0.05)
+    p = estimate_layer(WorkloadLayer("gemv", "linear", 1, 8192, 8192), slow, F)
+    assert p.memory_bound and p.t_memory_s > p.t_compute_s
+    assert p.duration_s == pytest.approx(p.t_memory_s)
+
+
+def test_roofline_crossover_follows_arithmetic_intensity():
+    """With full array utilisation (aligned dims, large K) memory_bound <=> AI < ridge."""
+    slow = cfg(hbm_bw_tb_s_per_stack=0.05)
+    lo = estimate_layer(WorkloadLayer("lo", "linear", 256, 4096, 4096), slow, F)
+    hi = estimate_layer(WorkloadLayer("hi", "linear", 8192, 4096, 4096), slow, F)
+    assert lo.arithmetic_intensity < lo.ridge_point and lo.memory_bound
+    assert hi.arithmetic_intensity > hi.ridge_point and not hi.memory_bound
+
+
+def test_duration_is_max_of_the_two_roofs_everywhere():
+    c = cfg(hbm_bw_tb_s_per_stack=0.2)
+    for M in (1, 7, 64, 256, 300, 4096):
+        for K in (64, 1000, 4096):
+            for N in (64, 513, 4096):
+                p = estimate_layer(WorkloadLayer("r", "linear", M, K, N), c, F)
+                assert p.duration_s == pytest.approx(max(p.t_compute_s, p.t_memory_s))
+                assert p.memory_bound == (p.t_memory_s > p.t_compute_s)
+                assert p.executed_flops / p.duration_s <= p.peak_exec_tflops * 1e12 * (1 + 1e-12)
+
+
+def test_sparsity_counted_once_never_exceeds_nominal_speedup():
+    c = cfg()
+    d = estimate_layer(WorkloadLayer("d", "linear", 8192, 8192, 8192, DType.INT8, 0.0), c, F)
+    s = estimate_layer(WorkloadLayer("s", "linear", 8192, 8192, 8192, DType.INT8, 0.5), c, F)
+    assert s.executed_flops == pytest.approx(d.executed_flops / 1.85)
+    assert 1.7 < d.duration_s / s.duration_s < 1.85       # fill/drain does not shrink -> < 1.85, never 1.85^2
+    assert s.dense_flops == d.dense_flops
+
+
+def test_sparsity_speedup_approaches_nominal_for_deep_reductions():
+    c = cfg()
+    d = estimate_layer(WorkloadLayer("d", "linear", 256, 131072, 256, DType.INT8, 0.0), c, F)
+    s = estimate_layer(WorkloadLayer("s", "linear", 256, 131072, 256, DType.INT8, 0.5), c, F)
+    assert d.duration_s / s.duration_s == pytest.approx(1.85, rel=0.01)
+
+
+def test_pipeline_overlap_hides_fill_drain():
+    l = WorkloadLayer("a", "linear", 1024, 64, 1024)      # 16 tiles, shallow K: fill/drain dominates
+    exposed = estimate_layer(l, cfg(array_size=64, pipeline_overlap=0.0), F)
+    hidden = estimate_layer(l, cfg(array_size=64, pipeline_overlap=1.0), F)
+    tiles = 16 * 16
+    assert exposed.t_compute_s == pytest.approx(tiles * (64 + 126) / (F * 1e9))
+    assert hidden.t_compute_s == pytest.approx((tiles * 64 + 126) / (F * 1e9))
+    assert hidden.util / exposed.util == pytest.approx((tiles * 190) / (tiles * 64 + 126), rel=1e-9)
+
+
+def test_dtype_scaling_int8_vs_fp16():
+    c = cfg()
+    i8 = estimate_layer(WorkloadLayer("a", "linear", 256, 131072, 256, DType.INT8), c, F)
+    f16 = estimate_layer(WorkloadLayer("b", "linear", 256, 131072, 256, DType.FP16), c, F)
+    assert f16.t_compute_s / i8.t_compute_s == pytest.approx(2.0, rel=0.01)
+    int4 = estimate_layer(WorkloadLayer("c", "linear", 256, 131072, 256, DType.INT4), c, F)
+    assert i8.t_compute_s / int4.t_compute_s == pytest.approx(2.0, rel=0.01)
+
+
+def test_sparse_weights_reduce_traffic():
+    c = cfg()
+    d = estimate_layer(WorkloadLayer("d", "linear", 8, 4096, 4096, DType.INT8, 0.0), c, F)
+    s = estimate_layer(WorkloadLayer("s", "linear", 8, 4096, 4096, DType.INT8, 0.5), c, F)
+    assert s.hbm_bytes < d.hbm_bytes
+    assert weight_bytes_factor(0.5, 1.0) == pytest.approx(0.5 * 1.25)
+
+
+def test_unsupported_sparsity_rejected():
+    with pytest.raises(ValueError):
+        WorkloadLayer("x", "linear", 8, 8, 8, DType.INT8, 0.75)
+    with pytest.raises(ValueError):
+        structured_sparsity_speedup(0.3)
+
+
+def test_small_sram_increases_traffic_big_sram_is_compulsory():
+    l = WorkloadLayer("t", "linear", 4096, 4096, 4096)
+    small = estimate_layer(l, cfg(onchip_sram_mb=1.0), F)
+    big = estimate_layer(l, cfg(onchip_sram_mb=4096.0), F)
+    compulsory = (4096 * 4096) * 3 * 1.0
+    assert big.hbm_bytes == pytest.approx(compulsory)
+    assert small.hbm_bytes > 2 * big.hbm_bytes
+
+
+def test_ecc_overhead_reduces_bandwidth():
+    on = hbm_bandwidth_bytes_s(cfg(ecc_enabled=True))
+    off = hbm_bandwidth_bytes_s(cfg(ecc_enabled=False))
+    assert on == pytest.approx(off / 1.125)
+
+
+def test_util_bounded_and_profile_consistent():
+    c = cfg()
+    from uchu import build_transformer_workload
+    L = build_transformer_workload(num_layers=2)
+    pr = profile_pass(L, c, F)
+    assert 0.0 < pr.util <= 1.0
+    assert pr.duration_s == pytest.approx(sum(p.duration_s for p in pr.layers))
+    assert all(0.0 < p.util <= 1.0 for p in pr.layers)
+
+
+def test_duration_scales_inversely_with_frequency_when_compute_bound():
+    c = cfg()
+    l = WorkloadLayer("t", "linear", 8192, 8192, 8192)
+    a, b = estimate_layer(l, c, 1.0), estimate_layer(l, c, 2.0)
+    assert a.duration_s / b.duration_s == pytest.approx(2.0, rel=1e-6)
+```
+
+### `tests/test_thermal.py`
+
+```python
+import math
+
+import numpy as np
+import pytest
+
+from uchu import LumpedThermalModel, PowerModel, SimConfig
+from uchu.config import ProcessNode
+from uchu.thermal import SIGMA_SB
+
+
+def test_reference_power_at_nominal_equals_base_power():
+    c = SimConfig().validate()
+    pm = PowerModel(c)
+    assert pm.power_w(300.0, 1.5, 0.9, 1.0) == pytest.approx(50.0)
+
+
+def test_leakage_monotone_in_temperature():
+    pm = PowerModel(SimConfig())
+    p = [pm.breakdown(T, 1.5, 0.9)["leakage"] for T in (250, 300, 350, 400)]
+    assert all(b > a for a, b in zip(p, p[1:]))
+
+
+def test_dynamic_power_scales_with_f_and_v_squared():
+    pm = PowerModel(SimConfig())
+    a = pm.breakdown(300, 1.5, 0.9)
+    b = pm.breakdown(300, 0.75, 0.9 * 0.5)
+    for k in ("clock", "logic", "interconnect"):
+        assert b[k] == pytest.approx(a[k] * 0.5 * 0.25)
+
+
+def test_node_leakage_only_touches_static_power():
+    c7, c3 = SimConfig(), SimConfig()
+    c3.compute.process_node = ProcessNode.N3
+    c3.dvfs.nom_voltage_v = 0.8
+    c3.dvfs.nom_freq_ghz = 1.5
+    a, b = PowerModel(c7), PowerModel(c3)
+    assert b.static_nom_w == pytest.approx(a.static_nom_w * 3.5 / 2.1)
+    assert b.dynamic_nom_w == pytest.approx(a.dynamic_nom_w * 0.72)   # cap factor, not leakage
+
+
+def test_static_scales_with_area_dynamic_with_macs():
+    a, b = SimConfig(), SimConfig()
+    b.compute.area_mm2 = 800.0
+    b.compute.array_size = 512
+    pa, pb = PowerModel(a), PowerModel(b)
+    assert pb.static_nom_w == pytest.approx(2 * pa.static_nom_w)
+    assert pb.dynamic_nom_w == pytest.approx(4 * pa.dynamic_nom_w)
+
+
+def test_dvfs_throttle_curve_smooth_and_monotone():
+    pm = PowerModel(SimConfig())
+    f = [pm.dvfs_state(T).freq_ghz for T in np.linspace(300, 420, 41)]
+    assert f[0] == pytest.approx(1.5)
+    assert all(b <= a + 1e-12 for a, b in zip(f, f[1:]))
+    assert pm.dvfs_state(300).throttled is False and pm.dvfs_state(400).throttled is True
+    assert min(f) >= 0.1 * 1.5 - 1e-12
+
+
+def test_steady_state_matches_closed_form_for_constant_power():
+    c = SimConfig()
+    th = LumpedThermalModel(c)
+    P = 80.0
+    T = th.steady_state(lambda T: P, eclipse=True)
+    k = c.thermal.emissivity * SIGMA_SB * c.thermal.view_factor * c.thermal.radiator_area_m2
+    assert T == pytest.approx(((P + th.env_load_w(True)) / k) ** 0.25, rel=1e-9)
+
+
+def test_time_integration_converges_to_steady_state():
+    c = SimConfig()
+    th = LumpedThermalModel(c)
+    th.T = 200.0
+    T_ss = th.steady_state(lambda T: 60.0, True)
+    for _ in range(2000):                      # 60 000 s ~ 90 thermal time constants
+        th.step(30.0, lambda T: 60.0, True)
+    assert th.T == pytest.approx(T_ss, rel=1e-9)   # the BE fixed point IS the steady state
+
+
+def _integrate(dt, t_end=300.0, T0=200.0):
+    th = LumpedThermalModel(SimConfig()); th.T = T0
+    for _ in range(int(round(t_end / dt))):
+        th.step(dt, lambda T: 70.0, False)
+    return th.T
+
+
+def test_first_order_convergence_in_dt():
+    ref = _integrate(0.05)
+    e = [abs(_integrate(dt) - ref) for dt in (60.0, 30.0, 15.0)]
+    assert e[0] > e[1] > e[2]
+    assert 1.5 < e[0] / e[1] < 2.6 and 1.5 < e[1] / e[2] < 2.6     # backward Euler: O(dt)
+
+
+def test_unconditionally_stable_with_huge_step():
+    th = LumpedThermalModel(SimConfig()); th.T = 200.0
+    T_ss = th.steady_state(lambda T: 60.0, False)
+    th.step(1e7, lambda T: 60.0, False)
+    # one finite BE step leaves a residual ~ C (T-T0) / (dt h') ~ 5e-3 K; it must be finite and tiny
+    assert math.isfinite(th.T) and abs(th.T - T_ss) < 0.02
+
+
+def test_energy_balance_closes_per_step():
+    c = SimConfig(); th = LumpedThermalModel(c); th.T = 250.0
+    pm = PowerModel(c)
+    pf = lambda T: pm.power_w(T, 1.5, 0.9, 1.0)
+    for dt in (0.01, 1.0, 20.0, 400.0):
+        T0 = th.T
+        T1 = th.step(dt, pf, False)
+        stored = c.thermal.capacitance_j_per_k * (T1 - T0)
+        net = (pf(T1) + th.env_load_w(False) - th.radiated_w(T1)) * dt      # implicit-Euler end-point rule
+        assert stored == pytest.approx(net, rel=1e-7, abs=1e-7)
+
+
+def test_sunlit_hotter_than_eclipse():
+    c = SimConfig(); th = LumpedThermalModel(c)
+    pf = lambda T: 60.0
+    assert th.steady_state(pf, False) > th.steady_state(pf, True)
+
+
+def test_cooling_direction_and_bounds():
+    th = LumpedThermalModel(SimConfig()); th.T = 600.0
+    th.step(100.0, lambda T: 10.0, True)
+    assert 3.0 < th.T < 600.0
+
+
+def test_thermal_runaway_detected():
+    c = SimConfig()
+    c.power.leak_temp_coeff = 12.0
+    c.thermal.radiator_area_m2 = 0.02
+    pm = PowerModel(c); th = LumpedThermalModel(c)
+    th.T = 380.0
+    for _ in range(50):
+        th.step(60.0, lambda T: pm.power_w(T, 1.5, 0.9, 1.0), False)
+        if th.runaway:
+            break
+    assert th.runaway
+    assert pm  # keep linter quiet
+
+
+def test_view_factor_degrades_with_mission_year():
+    c = SimConfig(); c.thermal.mission_year = 10.0
+    a, b = LumpedThermalModel(SimConfig()), LumpedThermalModel(c)
+    assert b.radiated_w(300.0) < a.radiated_w(300.0)
+    assert b.effective_view_factor == pytest.approx(0.85 * 0.8)
+
+
+def test_default_design_is_thermally_feasible():
+    c = SimConfig(); pm = PowerModel(c); th = LumpedThermalModel(c)
+    T = th.steady_state(lambda T: pm.power_w(T, 1.5, 0.9, 1.0), False)
+    assert T is not None and T < c.dvfs.throttle_onset_k
+```
+
+### `tests/test_orbit.py`
+
+```python
+import math
+
+import numpy as np
+import pytest
+
+from uchu import SimConfig, make_rng
+from uchu.config import OrbitalConfig, OrbitType, SolarActivity
+from uchu.orbit import (FlareSchedule, OrbitalEnvironment, SEP_EVENTS_PER_YEAR, eclipse_fraction,
+                        kepler_period_s)
+
+
+def test_kepler_periods():
+    assert kepler_period_s(400) == pytest.approx(5554, rel=2e-3)
+    assert kepler_period_s(35786) == pytest.approx(86164, rel=2e-3)     # sidereal day
+
+
+def test_eclipse_fraction_known_values():
+    assert eclipse_fraction(400, 0.0) == pytest.approx(0.39, abs=0.01)
+    assert eclipse_fraction(35786, 0.0) == pytest.approx(0.048, abs=0.003)
+    assert eclipse_fraction(550, 80.0) == 0.0         # high beta: no eclipse
+
+
+def test_deep_space_never_eclipsed():
+    o = OrbitalEnvironment(OrbitalConfig.for_orbit(OrbitType.DEEP))
+    assert o.eclipse_segments(0, 1e6) == [(0, 1e6, False)]
+
+
+@pytest.mark.parametrize("t0,t1", [(0.0, 1.0), (100.0, 20000.0), (5000.3, 5001.7), (0.0, 100000.0)])
+def test_eclipse_segments_partition_interval_exactly(t0, t1):
+    o = OrbitalEnvironment(OrbitalConfig())
+    segs = o.eclipse_segments(t0, t1)
+    assert segs[0][0] == t0 and segs[-1][1] == t1
+    for (a, b, _), (c, d, _) in zip(segs, segs[1:]):
+        assert b == c
+    for a, b, e in segs:
+        assert b > a
+        mid = 0.5 * (a + b)
+        assert o.in_eclipse(mid) == e
+    total_ecl = sum(b - a for a, b, e in segs if e)
+    assert total_ecl == pytest.approx(o.eclipse_fraction * (t1 - t0), abs=o.period_s * o.eclipse_fraction)
+
+
+def test_eclipse_time_over_many_orbits_matches_fraction():
+    o = OrbitalEnvironment(OrbitalConfig())
+    n = 50
+    segs = o.eclipse_segments(0.0, n * o.period_s)
+    assert sum(b - a for a, b, e in segs if e) == pytest.approx(n * o.period_s * o.eclipse_fraction, rel=1e-9)
+
+
+def test_flare_integral_exact_and_additive():
+    s = FlareSchedule.from_events([(100.0, 200.0, 2.0), (150.0, 400.0, 1.0)])
+    assert s.intensity_integral(0, 1000) == pytest.approx(100 * 2 + 250 * 1)
+    assert s.intensity_integral(120, 180) == pytest.approx(60 * 2 + 30 * 1)
+    a = s.intensity_integral(0, 170) + s.intensity_integral(170, 1000)
+    assert a == pytest.approx(s.intensity_integral(0, 1000))
+    assert s.intensity_at(160) == 3.0 and s.intensity_at(250) == 1.0 and s.intensity_at(500) == 0.0
+
+
+def test_flare_integral_matches_brute_force():
+    s = FlareSchedule.from_events([(10.0, 55.5, 1.7), (40.0, 90.0, 0.4)])
+    t = np.linspace(0, 100, 200001)
+    brute = sum(s.intensity_at(x) for x in t[::200]) * (t[200] - t[0])
+    assert s.intensity_integral(0, 100) == pytest.approx(brute, rel=0.02)
+
+
+def test_schedule_prefix_independent_of_query_order():
+    a = FlareSchedule(1 / 1e5, make_rng(3, "f")); b = FlareSchedule(1 / 1e5, make_rng(3, "f"))
+    a.intensity_integral(0, 5e6)
+    for t in np.linspace(0, 5e6, 25):
+        b.intensity_integral(0, t)
+    n = min(len(a.events), len(b.events))
+    assert n > 10 and a.events[:n] == b.events[:n]
+
+
+def test_flare_arrival_rate_statistics():
+    rate = SEP_EVENTS_PER_YEAR[SolarActivity.HIGH] / (365.25 * 86400)
+    counts = []
+    for i in range(200):
+        s = FlareSchedule(rate, make_rng(i, "f"))
+        s.extend_to(10 * 365.25 * 86400)
+        counts.append(sum(1 for e in s.events if e[0] <= 10 * 365.25 * 86400))
+    assert np.mean(counts) == pytest.approx(80.0, rel=0.05)
+    assert np.var(counts) == pytest.approx(80.0, rel=0.3)        # Poisson: var == mean
+
+
+def test_flare_intensity_is_lognormal_median_one():
+    s = FlareSchedule(1e-3, make_rng(1, "g")); s.extend_to(5e6)
+    inten = np.array([e[2] for e in s.events])
+    assert np.median(inten) == pytest.approx(1.0, rel=0.1)
+```
+
+### `tests/test_radiation.py`
+
+```python
+import math
+
+import numpy as np
+import pytest
+from scipy.integrate import quad
+
+from uchu import (EccMemory, RadiationEnvironment, RadiationSubsystem, SimConfig, TruncatedPowerLaw,
+                  integral_rate, make_rng)
+from uchu.config import CrossSection, OrbitalConfig, OrbitType, SolarActivity
+from uchu.orbit import FlareSchedule, OrbitalEnvironment
+from uchu.radiation import RadiationStats, TabulatedSpectrum
+
+LAW = TruncatedPowerLaw(2e-3, 1.0, 1.6, 150.0)
+
+
+# --------------------------------------------------------------------------- spectra & quadrature
+def test_spectrum_is_continuous_to_zero_and_consistent_with_differential():
+    assert LAW.integral(150.0) == 0.0 and LAW.integral(1e3) == 0.0
+    assert LAW.integral(149.999) == pytest.approx(0.0, abs=1e-8)
+    x, h = 3.0, 1e-5
+    num = -(LAW.integral(x + h) - LAW.integral(x - h)) / (2 * h)
+    assert LAW.differential(x) == pytest.approx(float(num), rel=1e-6)
+
+
+def test_total_flux_mass_is_exact():
+    one = lambda x: np.ones_like(x)
+    assert integral_rate(one, LAW, 1e-2) == pytest.approx(float(LAW.integral(1e-2)), rel=1e-12)
+
+
+def test_step_cross_section_is_exact_with_threshold_node():
+    sig = 3e-14
+    for xth in (0.5, 2.0, 17.3, 80.0):
+        step = lambda x, xth=xth: np.where(x > xth, sig, 0.0)
+        got = integral_rate(step, LAW, 1e-2, extra_nodes=[xth])
+        assert got == pytest.approx(sig * float(LAW.integral(xth)), rel=1e-12)
+
+
+def test_weibull_integral_matches_adaptive_quadrature():
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    ref, _ = quad(lambda x: float(cs(x)) * float(LAW.differential(x)), 1e-2, 150.0,
+                  points=[0.5, 1, 5, 20, 50], limit=2000, epsrel=1e-10)
+    got = integral_rate(cs, LAW, 1e-2, extra_nodes=[0.5])
+    assert got == pytest.approx(ref, rel=2e-3)
+
+
+def test_quadrature_converges_with_grid():
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    coarse = integral_rate(cs, LAW, 1e-2, n=500, extra_nodes=[0.5])
+    fine = integral_rate(cs, LAW, 1e-2, n=32000, extra_nodes=[0.5])
+    mid = integral_rate(cs, LAW, 1e-2, n=4000, extra_nodes=[0.5])
+    assert abs(mid - fine) < abs(coarse - fine)
+    assert mid == pytest.approx(fine, rel=1e-3)
+
+
+def test_weibull_cross_section_properties():
+    cs = CrossSection(2e-14, 3.0, 10.0, 2.0)
+    assert cs(3.0) == 0.0 and cs(0.1) == 0.0
+    x = np.linspace(0, 500, 1001)
+    s = cs(x)
+    assert np.all(np.diff(s) >= -1e-30) and s[-1] == pytest.approx(2e-14, rel=1e-6)
+    assert cs(3.0 + 10.0) == pytest.approx(2e-14 * (1 - math.exp(-1.0)))     # z = 1
+
+
+def test_tabulated_spectrum_reproduces_analytic_rate():
+    x = np.geomspace(1e-2, 150.0, 400)
+    tab = TabulatedSpectrum(x, LAW.integral(x))
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    a = integral_rate(cs, LAW, 1e-2, extra_nodes=[0.5])
+    b = integral_rate(cs, tab, 1e-2, extra_nodes=[0.5])
+    assert b == pytest.approx(a, rel=0.03)
+
+
+def test_tabulated_spectrum_validates_input():
+    with pytest.raises(ValueError):
+        TabulatedSpectrum([1, 2, 3], [1.0, 2.0, 0.5])      # flux must not increase with x
+    with pytest.raises(ValueError):
+        TabulatedSpectrum([2, 1, 3], [3.0, 2.0, 1.0])
+
+
+# --------------------------------------------------------------------------- environment physics
+def _env(ot=OrbitType.LEO, alt=None, inc=51.6, sol=SolarActivity.MODERATE, shield=2.0):
+    c = SimConfig()
+    c.orbital = OrbitalConfig.for_orbit(ot, inclination_deg=inc, solar_activity=sol)
+    if alt:
+        c.orbital.altitude_km = alt
+    c.radiation.shield_mm_al = shield
+    o = OrbitalEnvironment(c.orbital)
+    o.flares = FlareSchedule.from_events([])
+    return RadiationEnvironment(c.validate(), o)
+
+
+def test_default_leo_sram_rate_is_in_sane_range():
+    per_bit_day = _env().static_rate["sram"] * 86400
+    assert 1e-13 < per_bit_day < 1e-7
+
+
+def test_orbit_ordering():
+    r = {k: _env(*a, **kw).static_rate["sram"] for k, (a, kw) in {
+        "leo400": ((), dict(alt=400)), "leo550": ((), {}), "leo1000": ((), dict(alt=1000)),
+        "meo": ((OrbitType.MEO,), {}), "geo": ((OrbitType.GEO,), {}), "deep": ((OrbitType.DEEP,), {})}.items()}
+    assert r["meo"] > r["leo1000"] > r["leo550"] > r["leo400"] > r["geo"]
+    assert r["geo"] == pytest.approx(r["deep"], rel=1e-12, abs=0)
+
+
+def test_gcr_anticorrelated_with_solar_activity():
+    d = {s: _env(OrbitType.DEEP, sol=s).static_rate["sram"] for s in SolarActivity}
+    assert d[SolarActivity.LOW] > d[SolarActivity.MODERATE] > d[SolarActivity.HIGH]     # v2 had this backwards
+
+
+def test_geomagnetic_shielding_by_inclination():
+    eq, mid, polar = (_env(inc=i).sep_coeff["sram"] for i in (0.1, 51.6, 97.0))
+    assert eq < mid < polar
+
+
+def test_shielding_reduces_proton_rate():
+    assert _env(shield=20.0).static_rate["sram"] < _env(shield=2.0).static_rate["sram"] < _env(shield=0.0).static_rate["sram"]
+
+
+def test_expected_counts_linear_in_units_and_time_without_flares():
+    e = _env()
+    base = e.expected("sram", 1e6, 0.0, 100.0)
+    assert e.expected("sram", 2e6, 0.0, 100.0) == pytest.approx(2 * base, rel=1e-12, abs=0)
+    assert e.expected("sram", 1e6, 50.0, 250.0) == pytest.approx(2 * base, rel=1e-12, abs=0)
+    assert e.expected("sram", 0, 0.0, 100.0) == 0.0 and e.expected("sram", 1e6, 5.0, 5.0) == 0.0
+
+
+def test_flare_raises_expected_counts_exactly():
+    e = _env()
+    e.orbit.flares = FlareSchedule.from_events([(100.0, 200.0, 3.0)])
+    st, sep = e.static_rate["sram"], e.sep_coeff["sram"]
+    n = 1e6
+    assert e.expected("sram", n, 0, 100) == pytest.approx(n * st * 100, rel=1e-12, abs=0)
+    assert e.expected("sram", n, 100, 200) == pytest.approx(n * (st + 3.0 * sep) * 100, rel=1e-12, abs=0)
+    assert e.expected("sram", n, 0, 300) == pytest.approx(n * (st * 300 + 3.0 * sep * 100), rel=1e-12, abs=0)
+    assert e.rate_per_unit_s("sram", 150.0) == pytest.approx(st + 3.0 * sep, rel=1e-12, abs=0)
+    assert e.sep_coeff["sram"] / e.static_rate["sram"] > 1.0       # LEO: trapped protons dominate the baseline
+
+
+def test_flare_enhancement_is_enormous_where_baseline_is_tiny():
+    geo = _env(OrbitType.GEO)
+    assert geo.sep_coeff["sram"] / geo.static_rate["sram"] > 1e3     # GEO: no belts, SEP events dominate
+
+
+def test_config_rejects_cross_section_below_integration_grid():
+    c = SimConfig(); c.radiation.sram.ion.x_th = 1e-3
+    with pytest.raises(ValueError):
+        c.validate()
+
+
+# --------------------------------------------------------------------------- ECC memory
+def test_interleaved_word_mapping():
+    m = EccMemory(word_bits=64, interleave=4)
+    assert list(m.word_of(np.array([0, 1, 2, 3, 4, 255, 256, 257]))) == [0, 1, 2, 3, 0, 3, 4, 5]
+
+
+def test_single_flip_corrected_double_due_triple_sdc_quad_due():
+    for flips, expect in [(1, (1, 0, 0)), (2, (0, 1, 0)), (3, (0, 0, 1)), (4, (0, 1, 0))]:
+        m = EccMemory(64, 1)
+        m.inject(np.arange(flips))               # all in word 0 (interleave 1)
+        r = m.scrub(make_rng(0, "x"))
+        assert (r.corrected_words, r.due_words, r.sdc_words) == expect, flips
+        assert m.n_flipped == 0
+
+
+def test_xor_semantics_double_hit_on_same_bit_cancels():
+    m = EccMemory(64, 1)
+    m.inject([10]); m.inject([10])
+    assert m.n_flipped == 0 and m.scrub() == m.scrub()
+
+
+def test_accumulation_across_injects_creates_double_error():
+    m = EccMemory(64, 1)
+    m.inject([5]); m.inject([9])                 # two separate single hits in one word before scrub
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (0, 1)
+
+
+def test_scrub_clears_so_later_hits_do_not_accumulate():
+    m = EccMemory(64, 1)
+    m.inject([5]); m.scrub(); m.inject([9])
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (1, 0)
+
+
+def test_odd_miscorrection_probability_respected():
+    m = EccMemory(64, 1, odd_miscorrect_prob=0.0)
+    m.inject([0, 1, 2]); r = m.scrub(make_rng(0, "p"))
+    assert (r.sdc_words, r.due_words) == (0, 1)
+
+
+def test_no_ecc_every_corrupted_word_is_silent():
+    m = EccMemory(64, 1, ecc=False)
+    m.inject([0, 100, 200]); r = m.scrub()
+    assert (r.corrected_words, r.due_words, r.sdc_words) == (0, 0, 3)
+
+
+def test_interleaving_defeats_adjacent_cluster():
+    for I, expect in [(4, (4, 0, 0)), (1, (0, 1, 0))]:        # 4-bit cluster
+        m = EccMemory(64, I); m.inject(np.arange(100, 104))
+        r = m.scrub(make_rng(0, "i")); assert (r.corrected_words, r.due_words, r.sdc_words) == expect
+    m = EccMemory(64, 2); m.inject(np.arange(0, 3))           # bits 0,1,2 -> words 0,1,0
+    r = m.scrub(); assert (r.corrected_words, r.due_words) == (1, 1)
+
+
+@pytest.mark.slow
+def test_double_error_probability_matches_poisson_theory():
+    """Words with exactly 2 hits per scrub interval: n_words * mu^2/2 * exp(-mu) * (63/64)."""
+    rng = make_rng(11, "acc")
+    n_words, mu = 2_000_000, 0.05
+    m = EccMemory(64, 1)
+    k = int(rng.poisson(mu * n_words))
+    m.inject(rng.integers(0, n_words * 64, size=k))
+    r = m.scrub(make_rng(0, "s"))
+    due_exp = n_words * mu ** 2 / 2 * math.exp(-mu) * 63 / 64
+    corr_exp = n_words * mu * math.exp(-mu) * (1 - mu / 64)          # distinct-bit single hits
+    assert r.due_words == pytest.approx(due_exp, rel=0.08)
+    assert r.corrected_words == pytest.approx(corr_exp, rel=0.02)
+
+
+@pytest.mark.slow
+def test_due_rate_proportional_to_scrub_interval():
+    """Fixed exposure: DUE ~ lambda^2 * tau  => doubling the scrub interval doubles DUE."""
+    n_words, lam_w, total = 1_000_000, 0.02, 20.0        # hits / word / s, seconds
+    def due(tau):
+        rng = make_rng(5, "tau", tau)
+        m, d = EccMemory(64, 1), 0
+        for _ in range(int(total / tau)):
+            k = int(rng.poisson(lam_w * tau * n_words))
+            m.inject(rng.integers(0, n_words * 64, size=k))
+            d += m.scrub(make_rng(0, "s")).due_words
+        return d
+    d1, d2 = due(1.0), due(2.0)
+    assert 1.8 < d2 / d1 < 2.15
+
+
+# --------------------------------------------------------------------------- subsystem with a stub environment
+class Stub:
+    def __init__(self, **lam): self.lam = lam
+    def expected(self, region, n, t0, t1): return self.lam.get(region, 0.0) * (t1 - t0)
+
+
+def _sub(cfg=None, seed=0, **lam):
+    cfg = (cfg or SimConfig()).validate()
+    return RadiationSubsystem(cfg, Stub(**lam), make_rng(seed, "rad"))
+
+
+def test_mbu_fraction_and_cluster_size_distribution():
+    s = _sub(sram=2e5)
+    s.expose(0.0, 1.0, 1e9, 1.5)
+    L = s.ledger
+    assert L.n_seu_sram == pytest.approx(2e5, rel=0.02)
+    assert L.n_mbu / L.n_seu_sram == pytest.approx(0.10, abs=0.005)
+    sizes = _sub()._cluster_sizes(200_000)
+    assert sizes.min() == 2 and sizes.max() == 6
+    assert sizes.mean() == pytest.approx(2.9375, abs=0.02)
+
+
+def test_ecc_with_interleave_absorbs_all_mbu_but_without_it_fails():
+    c = SimConfig(); c.radiation.mbu_prob = 1.0; c.radiation.mbu_max_cluster = 4; c.radiation.ecc_interleave = 4
+    s = _sub(c, seed=3, sram=30.0); s.expose(0.0, 1.0, 5e8, 1.5)
+    s.scrub()
+    assert s.ledger.n_mbu == s.ledger.n_seu_sram > 10
+    assert s.ledger.words_due == 0 and s.ledger.sdc_sram == 0
+    assert s.ledger.words_corrected > s.ledger.n_seu_sram         # clusters corrected word by word
+
+    c = SimConfig(); c.radiation.mbu_prob = 1.0; c.radiation.mbu_max_cluster = 4; c.radiation.ecc_interleave = 1
+    s = _sub(c, seed=3, sram=30.0); s.expose(0.0, 1.0, 5e8, 1.5); s.scrub()
+    assert s.ledger.words_due + s.ledger.sdc_sram >= 0.9 * s.ledger.n_mbu
+
+
+def test_register_derating_and_tmr():
+    c = SimConfig(); c.radiation.avf_register = 0.3
+    s = _sub(c, register=1e5); s.expose(0, 1.0, 1e6, 1.5)
+    assert s.ledger.sdc_register == pytest.approx(0.3 * s.ledger.n_seu_reg, rel=0.03)
+    c.radiation.tmr_enabled = True
+    t = _sub(c, register=1e5); t.expose(0, 1.0, 1e6, 1.5)
+    assert t.ledger.sdc_register < 0.01 * s.ledger.sdc_register
+
+
+def test_set_capture_probability_scales_with_clock_frequency_and_saturates():
+    def frac(f, pw=150.0):
+        c = SimConfig(); c.radiation.set_pulse_width_ps = pw
+        s = _sub(c, logic_set=1e5); s.expose(0, 1.0, 1e6, f)
+        return s.ledger.n_set_latched / s.ledger.n_set_hits
+    assert frac(1.5) == pytest.approx(0.225, abs=0.01)
+    assert frac(3.0) == pytest.approx(0.45, abs=0.01)
+    assert frac(1.5, pw=1000.0) == 1.0
+
+
+def test_logic_avf_applied_after_capture():
+    c = SimConfig(); c.radiation.avf_logic = 0.2
+    s = _sub(c, logic_set=2e5); s.expose(0, 1.0, 1e6, 2.0)
+    assert s.ledger.sdc_logic == pytest.approx(0.2 * s.ledger.n_set_latched, rel=0.03)
+
+
+def test_sel_protected_costs_downtime_and_clears_memory():
+    s = _sub(sram=50.0, sel=1000.0)
+    s.expose(0, 1.0, 1e9, 1.5)
+    assert s.ledger.n_sel > 900 and not s.ledger.destroyed
+    assert s.ledger.downtime_s == pytest.approx(5.0 * s.ledger.n_sel)
+    assert s.mem.n_flipped == 0                      # power-cycle reloaded state
+
+
+def test_sel_unprotected_destroys_or_not_per_probability():
+    c = SimConfig(); c.radiation.sel_protected = False
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5); assert s.ledger.destroyed and s.ledger.destroyed_at_s == 1.0
+    c.radiation.sel_destructive_prob_unprotected = 0.0
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5); assert not s.ledger.destroyed
+    c.radiation.sel_destructive_prob_unprotected = 1.0
+    s = _sub(c, sel=50.0); s.expose(0, 1.0, 1e6, 1.5)
+    before = s.stats(1.0); s.expose(1.0, 2.0, 1e6, 1.5)
+    assert s.stats(1.0) == before                    # a destroyed chip accumulates nothing further
+
+
+def test_event_conservation_single_bit_hits_all_corrected():
+    c = SimConfig(); c.radiation.mbu_prob = 0.0
+    s = _sub(c, seed=4, sram=100.0); s.expose(0, 1.0, 5e8, 1.5); s.scrub()
+    assert s.ledger.words_corrected >= s.ledger.n_seu_sram - 2 and s.ledger.words_due <= 1
+
+
+def test_subsystem_is_deterministic_per_seed():
+    def run(seed):
+        s = _sub(seed=seed, sram=1e4, register=1e4, logic_set=1e4)
+        s.expose(0, 1.0, 1e8, 1.5); s.scrub(); return s.stats(1.0)
+    assert run(1) == run(1) and run(1) != run(2)
+
+
+# --------------------------------------------------------------------------- statistics object
+def _stats(**kw):
+    base = dict(elapsed_s=3600.0, n_seu_sram=0, n_mbu=0, n_seu_reg=0, n_set_hits=0, n_set_latched=0,
+                n_sel=0, words_corrected=0, words_due=0, sdc_sram_candidates=0, sdc_sram=0,
+                sdc_register=0, sdc_logic=0, downtime_s=0.0, destroyed=False)
+    base.update(kw); return RadiationStats(**base)
+
+
+def test_stats_rates_ci_and_survival():
+    s = _stats(sdc_sram=10, sdc_register=20, sdc_logic=6, words_due=18, downtime_s=36.0)
+    assert s.sdc_total == 36 and s.sdc_per_hr == 36.0 and s.due_per_hr == 18.0
+    assert s.fit_sdc == pytest.approx(3.6e10)
+    assert s.availability == pytest.approx(0.99)
+    lo, hi = s.sdc_per_hr_ci()
+    assert lo < 36.0 < hi
+    assert s.p_no_sdc(0.0) == 1.0 and s.p_no_sdc(0.01) == pytest.approx(math.exp(-0.36))
+    a, b = s.p_no_sdc_ci(0.01); assert a < s.p_no_sdc(0.01) < b
+
+
+def test_stats_zero_events_has_zero_rate_and_finite_upper_bound():
+    s = _stats()
+    lo, hi = s.sdc_per_hr_ci()
+    assert s.sdc_per_hr == 0.0 and lo == 0.0 and 3.5 < hi < 3.8       # rule of three: ~3.69 / 1 h
+    assert _stats(elapsed_s=0.0).sdc_per_hr == 0.0
+```
+
+### `tests/test_faults.py`
+
+```python
+import numpy as np
+import pytest
+
+from uchu import flip_bit, measure_gemm_vulnerability
+
+
+def test_int8_two_complement_flips_and_involution():
+    a = np.zeros(4, dtype=np.int8)
+    assert flip_bit(a, 2, 7)[2] == -128 and flip_bit(a, 2, 0)[2] == 1 and flip_bit(a, 2, 6)[2] == 64
+    b = flip_bit(a, 1, 5)
+    assert np.array_equal(flip_bit(b, 1, 5), a)
+    assert a.sum() == 0                                  # input untouched
+
+
+def test_float_flips_follow_ieee754():
+    assert flip_bit(np.array([1.0], np.float32), 0, 31)[0] == -1.0
+    assert np.isinf(flip_bit(np.array([1.0], np.float32), 0, 30)[0])
+    assert flip_bit(np.array([1.0], np.float16), 0, 15)[0] == -1.0
+    assert flip_bit(np.array([1.0], np.float32), 0, 0)[0] == np.nextafter(np.float32(1.0), np.float32(2.0))
+
+
+def test_flip_preserves_shape_and_handles_noncontiguous():
+    a = np.arange(12, dtype=np.int8).reshape(3, 4).T          # non-contiguous view
+    out = flip_bit(a, 5, 0)
+    assert out.shape == a.shape and (out != a).sum() == 1
+
+
+def test_flip_bit_range_checked():
+    with pytest.raises(ValueError):
+        flip_bit(np.zeros(2, np.int8), 0, 8)
+    with pytest.raises(ValueError):
+        flip_bit(np.zeros(2, np.float32), 0, -1)
+
+
+def test_avf_zero_tolerance_is_one_and_monotone_in_tolerance():
+    r0 = measure_gemm_vulnerability(tol=0.0, trials_per_bit=40, seed=1)
+    assert r0.avf == 1.0
+    prev = 1.0
+    for tol in (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 1e9):
+        r = measure_gemm_vulnerability(tol=tol, trials_per_bit=40, seed=1)
+        assert r.avf <= prev + 1e-12
+        prev = r.avf
+    assert prev == 0.0
+
+
+def test_int8_msb_is_far_more_vulnerable_than_lsb():
+    r = measure_gemm_vulnerability(tol=1e-2, trials_per_bit=80, seed=2)
+    assert r.per_bit_avf[7] > 0.9 and r.per_bit_avf[0] < 0.05
+    assert 0.2 < r.avf < 0.6                                  # roughly the top 3 of 8 bits matter
+    assert r.ci_low <= r.avf <= r.ci_high and r.ci_high - r.ci_low < 0.15
+    assert r.n_trials == 8 * 80
+
+
+def test_float32_exponent_bits_dominate():
+    r = measure_gemm_vulnerability(dtype="float32", tol=1e-2, trials_per_bit=60, seed=3)
+    assert r.per_bit_avf[30] > 0.7 and r.per_bit_avf[0] == 0.0 and r.per_bit_avf[23] < r.per_bit_avf[30]
+
+
+def test_vulnerability_is_reproducible_and_seed_sensitive():
+    kw = dict(dtype="float32", tol=1e-3, trials_per_bit=30)      # fractional per-bit AVFs (mantissa bits)
+    a = measure_gemm_vulnerability(seed=7, **kw)
+    assert a == measure_gemm_vulnerability(seed=7, **kw)
+    assert a.per_bit_avf != measure_gemm_vulnerability(seed=8, **kw).per_bit_avf
+```
+
+### `tests/test_simulator.py`
+
+```python
+import random
+
+import numpy as np
+import pytest
+
+from uchu import (ChipSimulator, SimConfig, build_transformer_workload, profile_pass, run_ensemble,
+                  run_mission, run_workload)
+from uchu.config import OrbitalConfig, OrbitType, SolarActivity
+from uchu.orbit import FlareSchedule
+
+LAYERS = build_transformer_workload(num_layers=2)
+
+
+def hot_cfg(factor=1e8, **over):
+    """Cross-sections inflated so rare events become countable in short, fast tests."""
+    c = SimConfig()
+    for reg in (c.radiation.sram, c.radiation.register, c.radiation.logic_set):
+        reg.ion.sigma_sat_cm2 *= factor
+        reg.proton.sigma_sat_cm2 *= factor
+    c.radiation.scrub_interval_s = 1.0
+    for k, v in over.items():
+        setattr(c, k, v)
+    return c.validate()
+
+
+# ---------------------------------------------------------------- single clock & determinism
+def test_run_does_not_touch_global_rngs():
+    np.random.seed(1); random.seed(1)
+    n0, p0 = np.random.get_state()[1].copy(), random.getstate()
+    run_workload(hot_cfg(), LAYERS, n_passes=20)
+    run_mission(hot_cfg(), LAYERS, 300.0)
+    assert np.array_equal(n0, np.random.get_state()[1]) and p0 == random.getstate()
+
+
+def test_mission_clock_is_exact_and_energy_is_consistent():
+    r = run_mission(SimConfig(), LAYERS, 12345.6)
+    assert r.simulated_s == pytest.approx(12345.6, abs=1e-6) and r.completed
+    assert r.energy_j == pytest.approx(r.avg_power_w * r.simulated_s)
+    assert 5.0 < r.avg_power_w < 120.0
+
+
+def test_workload_elapsed_equals_sum_of_pass_durations_when_unthrottled():
+    c = SimConfig()
+    r = run_workload(c, LAYERS, n_passes=50)
+    prof = profile_pass(LAYERS, c, c.dvfs.nom_freq_ghz)
+    assert r.elapsed_s == pytest.approx(50 * prof.duration_s, rel=1e-12)
+    assert r.dense_flops == pytest.approx(50 * prof.dense_flops)
+    assert len(r.first_pass_layers) == len(LAYERS)
+    assert r.avg_tflops_dense <= 2 * 256 * 256 * 1.5e9 / 1e12 * 1.0001 * 1.85
+
+
+def test_same_seed_identical_different_seed_differs():
+    a = run_mission(hot_cfg(), LAYERS, 400.0, seed=5)
+    b = run_mission(hot_cfg(), LAYERS, 400.0, seed=5)
+    c = run_mission(hot_cfg(), LAYERS, 400.0, seed=6)
+    assert a.radiation == b.radiation and a.energy_j == b.energy_j
+    assert a.radiation != c.radiation
+    assert a.radiation.n_seu_sram > 1000                 # hot config really produces events
+
+
+def test_provenance_attached():
+    r = run_workload(SimConfig(), LAYERS, n_passes=2)
+    assert r.provenance["config_hash"] == SimConfig().config_hash() and r.provenance["model_version"] == "3.0.0"
+
+
+# ---------------------------------------------------------------- thermal / orbit coupling
+def test_eclipse_cycles_drive_temperature_swings():
+    c = SimConfig(); c.thermal.capacitance_j_per_k = 50.0           # fast enough to follow the eclipse
+    r = run_mission(c, LAYERS, 3 * 5739.0, duty=1.0, dt_max_s=10.0, record_every_s=20.0)
+    T, ecl = r.series["T"], r.series["eclipse"]
+    assert ecl.any() and (~ecl).any()
+    assert T[~ecl].mean() > T[ecl].mean() + 3.0
+    assert r.T_max_k - r.T_min_k > 5.0
+    assert 0.3 < ecl.mean() < 0.45                                   # ~37 % of samples in shadow
+
+
+def test_deep_space_has_no_eclipse_swing():
+    c = SimConfig(); c.orbital = OrbitalConfig.for_orbit(OrbitType.DEEP); c.thermal.capacitance_j_per_k = 50.0
+    r = run_mission(c, LAYERS, 6000.0, record_every_s=20.0)
+    assert not r.series["eclipse"].any()
+    assert np.ptp(r.series["T"][len(r.series["T"]) // 2:]) < 0.5      # settled
+
+
+def test_throttling_feedback_limits_temperature_and_throughput():
+    big, small = SimConfig(), SimConfig()
+    small.thermal.radiator_area_m2 = 0.06
+    a = run_mission(big, LAYERS, 8000.0, dt_max_s=20.0)
+    b = run_mission(small, LAYERS, 8000.0, dt_max_s=20.0)
+    assert a.throttled_fraction == 0.0 and b.throttled_fraction > 0.5
+    assert b.avg_tflops_dense < 0.95 * a.avg_tflops_dense
+    assert b.T_max_k < small.power.T_max_k + 5.0 and not b.failed
+
+
+def test_thermal_runaway_reported_not_hidden():
+    c = SimConfig(); c.power.leak_temp_coeff = 12.0; c.thermal.radiator_area_m2 = 0.02; c.thermal.T_init_k = 380.0
+    r = run_mission(c, LAYERS, 20000.0, dt_max_s=30.0)
+    assert r.failed and r.fail_reason == "thermal_runaway" and not r.completed and r.simulated_s < 20000.0
+
+
+def test_duty_cycle_reduces_power_and_work_but_not_exposure():
+    full = run_mission(SimConfig(), LAYERS, 2000.0, duty=1.0)
+    idle = run_mission(SimConfig(), LAYERS, 2000.0, duty=0.0)
+    assert idle.dense_flops == 0.0 and idle.avg_power_w < full.avg_power_w
+    with pytest.raises(ValueError):
+        run_mission(SimConfig(), LAYERS, 10.0, duty=1.5)
+
+
+# ---------------------------------------------------------------- radiation coupled to the clock
+def test_flare_raises_observed_upset_rate_by_predicted_factor():
+    c = hot_cfg(1e8)
+    sim = ChipSimulator(c, seed=3)
+    sim.orbit.flares = FlareSchedule.from_events([(1000.0, 2000.0, 10.0)])
+    prof = profile_pass(LAYERS, c, 1.5)
+    counts, t_mark = [], 0
+    for t_end in (1000.0, 2000.0, 3000.0):
+        before = sim.rad.ledger.n_seu_sram
+        while sim.t < t_end - 1e-9:
+            sim.advance(min(10.0, t_end - sim.t), prof.util, prof.live_sram_bits, sim.dvfs())
+        counts.append(sim.rad.ledger.n_seu_sram - before)
+    st, sep = sim.env.static_rate["sram"], sim.env.sep_coeff["sram"]
+    pred = (st + 10.0 * sep) / st
+    obs = counts[1] / counts[0]
+    assert counts[0] > 1000 and obs == pytest.approx(pred, rel=0.1)
+    assert counts[2] == pytest.approx(counts[0], rel=0.15)           # back to baseline afterwards
+
+
+def test_observed_seu_count_matches_expected_value():
+    c = hot_cfg(1e8)
+    r = run_mission(c, LAYERS, 600.0, seed=9)
+    sim = ChipSimulator(c, seed=9)
+    prof = profile_pass(LAYERS, c, 1.5)
+    exp = sim.env.expected("sram", prof.live_sram_bits, 0.0, 600.0)
+    assert exp > 1000
+    assert abs(r.radiation.n_seu_sram - exp) < 5 * exp ** 0.5     # within 5 Poisson sigma
+
+
+def test_tmr_and_ecc_reduce_silent_corruption_end_to_end():
+    base = run_mission(hot_cfg(), LAYERS, 600.0, seed=2).radiation
+    c = hot_cfg(); c.radiation.tmr_enabled = True
+    tmr = run_mission(c, LAYERS, 600.0, seed=2).radiation
+    assert base.sdc_register > 100 and tmr.sdc_register < 0.01 * base.sdc_register
+    assert tmr.sdc_logic <= base.sdc_logic
+    c2 = hot_cfg(); c2.memory.ecc_enabled = False
+    noecc = run_mission(c2, LAYERS, 600.0, seed=2).radiation
+    assert noecc.sdc_sram > 20 * max(base.sdc_sram, 1)
+    assert base.words_corrected > 0
+
+
+def test_scrub_interval_controls_double_errors_end_to_end():
+    def due(scrub):
+        c = hot_cfg(3e10); c.radiation.scrub_interval_s = scrub; c.radiation.mbu_prob = 0.0
+        return run_mission(c, LAYERS, 240.0, dt_max_s=20.0, seed=4).radiation.words_due
+    fast, slow = due(1.0), due(8.0)
+    assert fast > 1000
+    assert 5.0 < slow / fast < 11.0              # DUE ~ lambda^2 * tau  => ratio ~ 8 for an 8x longer interval
+
+
+def test_destructive_latchup_stops_the_mission():
+    c = hot_cfg(); c.radiation.sel_protected = False
+    c.radiation.sel.ion.sigma_sat_cm2 = 1e5                # absurdly latch-up prone
+    r = run_mission(c, LAYERS, 5000.0, seed=1)
+    assert r.failed and r.fail_reason == "single_event_latchup_destructive" and r.simulated_s < 5000.0
+
+
+def test_protected_latchup_costs_availability_not_the_mission():
+    c = hot_cfg(); c.radiation.sel.ion.sigma_sat_cm2 = 1e3
+    r = run_mission(c, LAYERS, 3000.0, seed=1)
+    assert not r.failed and r.radiation.n_sel > 0
+    assert r.availability < 1.0 and r.radiation.downtime_s == pytest.approx(5.0 * r.radiation.n_sel)
+
+
+def test_geo_flare_scenario_sees_flare_events_in_year_scale_schedule():
+    c = SimConfig(); c.orbital = OrbitalConfig.for_orbit(OrbitType.GEO, solar_activity=SolarActivity.HIGH)
+    sim = ChipSimulator(c, seed=1)
+    sim.orbit.flares.extend_to(365.25 * 86400.0)
+    assert 2 <= len(sim.orbit.flares.events) <= 25
+
+
+# ---------------------------------------------------------------- ensemble
+@pytest.mark.slow
+def test_ensemble_parallel_equals_serial_and_ci_is_sane():
+    c = hot_cfg()
+    ser = run_ensemble(c, LAYERS, 4, 150.0, dt_max_s=10.0, n_jobs=1, base_seed=11)
+    par = run_ensemble(c, LAYERS, 4, 150.0, dt_max_s=10.0, n_jobs=2, base_seed=11)
+    assert ser.total_sdc == par.total_sdc and ser.total_due == par.total_due
+    assert np.array_equal(ser.per_sample_sdc_per_hr, par.per_sample_sdc_per_hr)
+    lo, hi = ser.sdc_per_hr_ci
+    assert lo <= ser.sdc_per_hr <= hi and ser.n_failed == 0 and ser.total_sdc > 0
+    other = run_ensemble(c, LAYERS, 4, 150.0, dt_max_s=10.0, base_seed=12)
+    assert other.total_sdc != ser.total_sdc
+
+
+@pytest.mark.slow
+def test_ensemble_samples_solar_scenarios():
+    w = {SolarActivity.LOW: 0.5, SolarActivity.HIGH: 0.5}
+    r = run_ensemble(hot_cfg(), LAYERS, 6, 100.0, base_seed=3, solar_weights=w)
+    assert r.n_samples == 6 and r.total_hours == pytest.approx(6 * 100.0 / 3600.0)
+
+
+@pytest.mark.slow
+def test_one_simulated_day_completes_with_realistic_rates():
+    c = SimConfig(); c.radiation.scrub_interval_s = 10.0
+    r = run_mission(c, LAYERS, 86400.0, dt_max_s=30.0, record_every_s=600.0)
+    assert r.completed and r.simulated_s == pytest.approx(86400.0)
+    assert r.radiation.n_seu_sram >= 0 and r.availability == 1.0
+    assert r.series["T"].size > 100
+```
+
+### `tests/test_cal_data.py`
+
+```python
+import math
+import textwrap
+
+import numpy as np
+import pytest
+
+from uchu import SimConfig, make_rng
+from uchu.calibration import data as D
+from uchu.calibration.data import CalibrationDataError, effective_let
+from uchu.calibration.registry import (STATUS_ACCEPTED, UncalibratedError, accept_placeholder, declare, get_by_path,
+                                       placeholder_audit, record, require_calibrated, required_paths, set_by_path)
+from uchu.calibration.synthetic import bake_environment_tables
+from uchu.config import OrbitalConfig, OrbitType, SolarActivity, SpectrumTable
+from uchu.orbit import FlareSchedule, OrbitalEnvironment
+from uchu.radiation import RadiationEnvironment, RadiationSubsystem
+from uchu.memory import hbm_bandwidth_bytes_s
+
+
+# ------------------------------------------------------------------ config round trip & new hooks
+def test_config_round_trip_default_and_modified():
+    c = SimConfig().validate()
+    assert SimConfig.from_dict(c.to_dict()).config_hash() == c.config_hash()
+    c.orbital = OrbitalConfig.for_orbit(OrbitType.GEO, solar_activity=SolarActivity.HIGH, sep_events_per_year=3.5)
+    c.radiation.tables = {"gcr_ion": SpectrumTable([0.1, 1, 10], [1e-2, 1e-3, 1e-5])}
+    c.radiation.environment_mode = "tabulated_orbit"
+    record(c, "power.base_power_w", source="bench", method="fit", ci=(1.0, 2.0))
+    c2 = SimConfig.from_json(c.to_json())
+    assert c2.config_hash() == c.config_hash()
+    assert c2.orbital.orbit_type is OrbitType.GEO and c2.orbital.sep_events_per_year == 3.5
+    assert isinstance(c2.radiation.tables["gcr_ion"], SpectrumTable) and c2.calibration["power.base_power_w"]["ci95"] == [1.0, 2.0]
+
+
+def test_from_dict_is_strict_and_spectrum_tables_canonical():
+    with pytest.raises(ValueError, match="unknown field"):
+        SimConfig.from_dict({"nonsense": 1})
+    with pytest.raises(ValueError, match="unknown field"):
+        SimConfig.from_dict({"radiation": {"sram": {"ion": {"sigma_sat_cm2": 1, "x_th": 1, "width": 1, "shape": 1, "bogus": 2},
+                                                        "proton": {"sigma_sat_cm2": 1, "x_th": 1, "width": 1, "shape": 1}}}})
+    assert SpectrumTable([1, 2], [3, 2]).x == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("mutate,msg", [
+    (lambda c: setattr(c.radiation, "environment_mode", "magic"), "environment_mode"),
+    (lambda c: setattr(c.radiation, "environment_mode", "tabulated_orbit"), "at least one table"),
+    (lambda c: c.radiation.tables.update(bogus=SpectrumTable([1, 2], [2, 1])), "unknown spectrum table"),
+    (lambda c: c.radiation.tables.update(gcr_ion=SpectrumTable([2, 1], [2, 1])), "ascending"),
+    (lambda c: c.radiation.tables.update(gcr_ion=SpectrumTable([1, 2], [1, 2])), "non-increasing"),
+    (lambda c: setattr(c.memory, "hbm_efficiency", 1.5), "hbm_efficiency"),
+    (lambda c: setattr(c.radiation, "mbu_cluster_geom_p", 0.0), "mbu_cluster_geom_p"),
+    (lambda c: setattr(c.orbital, "sep_intensity_median", -1.0), "SEP"),
+])
+def test_new_config_fields_validated(mutate, msg):
+    c = SimConfig(); mutate(c)
+    with pytest.raises(ValueError, match=msg):
+        c.validate()
+
+
+def _env(c):
+    o = OrbitalEnvironment(c.orbital); o.flares = FlareSchedule.from_events([])
+    return RadiationEnvironment(c.validate(), o)
+
+
+def test_baked_tables_reproduce_placeholder_rates():
+    base = SimConfig(); baked = bake_environment_tables(base)
+    e0, e1 = _env(base), _env(baked)
+    for r in ("sram", "register", "logic_set", "sel"):
+        assert e1.static_rate[r] == pytest.approx(e0.static_rate[r], rel=2e-3, abs=0)
+        if e0.sep_coeff[r] > 0:
+            assert e1.sep_coeff[r] == pytest.approx(e0.sep_coeff[r], rel=2e-3, abs=0)
+
+
+def test_tabulated_mode_bypasses_every_placeholder_scaling():
+    baked = bake_environment_tables(SimConfig())
+    e_ref = _env(baked)
+    placeholder_ref = _env(SimConfig())
+    for mutate in (lambda c: setattr(c.radiation, "shield_mm_al", 50.0),       # acts on proton terms
+                   lambda c: setattr(c.orbital, "inclination_deg", 5.0),        # acts on the geomagnetic factor (SEP/GCR)
+                   lambda c: setattr(c.orbital, "altitude_km", 1500.0)):        # acts on the trapped-proton factor
+        c = baked.copy(); mutate(c); e = _env(c)
+        for attr in ("static_rate", "sep_coeff"):                               # tables are authoritative: no reaction at all
+            assert getattr(e, attr)["sram"] == pytest.approx(getattr(e_ref, attr)["sram"], rel=1e-12, abs=0)
+        p = SimConfig(); mutate(p); ep = _env(p)                                # ...whereas the placeholders do react
+        reacts = any(getattr(ep, a)["sram"] != pytest.approx(getattr(placeholder_ref, a)["sram"], rel=1e-2, abs=0)
+                     for a in ("static_rate", "sep_coeff"))
+        assert reacts
+
+
+def test_tabulated_mode_bypasses_solar_modulation_where_gcr_dominates():
+    def deep(sol, tabulated):
+        c = SimConfig(); c.orbital = OrbitalConfig.for_orbit(OrbitType.DEEP, solar_activity=sol)
+        if tabulated:
+            c = bake_environment_tables(SimConfig().__class__.from_dict(
+                {**c.to_dict(), "orbital": {**c.to_dict()["orbital"], "solar_activity": "SolarActivity.LOW"}}))
+            c.orbital.solar_activity = sol            # tables baked at LOW; changing the label must change nothing
+        return _env(c).static_rate["sram"]
+    assert deep(SolarActivity.HIGH, False) < 0.6 * deep(SolarActivity.LOW, False)     # placeholders: GCR modulated
+    assert deep(SolarActivity.HIGH, True) == pytest.approx(deep(SolarActivity.LOW, True), rel=1e-12, abs=0)
+
+
+def test_missing_table_component_means_zero_flux():
+    baked = bake_environment_tables(SimConfig())
+    full = _env(baked).static_rate["sram"]
+    c = baked.copy(); del c.radiation.tables["trapped_proton"]
+    assert _env(c).static_rate["sram"] < 0.01 * full         # trapped protons dominate LEO
+    c = baked.copy(); del c.radiation.tables["sep_proton"]; del c.radiation.tables["sep_ion"]
+    assert _env(c).sep_coeff["sram"] == 0.0
+
+
+def test_hbm_efficiency_scales_bandwidth_linearly():
+    a, b = SimConfig(), SimConfig(); b.memory.hbm_efficiency = 0.5
+    assert hbm_bandwidth_bytes_s(b) == pytest.approx(0.5 * hbm_bandwidth_bytes_s(a))
+
+
+def test_mbu_geometric_parameter_controls_cluster_size():
+    def mean_size(q):
+        c = SimConfig(); c.radiation.mbu_cluster_geom_p = q
+        s = RadiationSubsystem(c.validate(), None, make_rng(0, "x"))
+        return s._cluster_sizes(200_000).mean()
+    assert mean_size(0.9) == pytest.approx(2.0 + 0.1 + 0.01 + 0.001 + 0.0001, abs=0.02) or mean_size(0.9) < 2.2
+    assert mean_size(0.2) > 3.2 > mean_size(0.5) > mean_size(0.9)
+
+
+def test_sep_statistics_configurable_and_default_unchanged():
+    from uchu.orbit import SEP_EVENTS_PER_YEAR
+    o0 = OrbitalEnvironment(OrbitalConfig(), make_rng(1, "o"))
+    assert o0.flares.rate == pytest.approx(SEP_EVENTS_PER_YEAR[SolarActivity.MODERATE] / (365.25 * 86400))
+    cfg = OrbitalConfig(sep_events_per_year=10.0, sep_mean_duration_s=3600.0, sep_intensity_median=5.0, sep_intensity_log_sigma=0.3)
+    o = OrbitalEnvironment(cfg, make_rng(1, "o")); o.flares.extend_to(60 * 365.25 * 86400.0)
+    ev = o.flares.events
+    assert len(ev) == pytest.approx(600, rel=0.15)
+    assert np.median([e[2] for e in ev]) == pytest.approx(5.0, rel=0.08)
+    assert np.mean([e[1] - e[0] for e in ev]) == pytest.approx(3600.0, rel=0.1)
+
+
+# ------------------------------------------------------------------ data layer
+def test_effective_let_cosine_law_and_limits():
+    assert effective_let(10.0, 0.0) == 10.0 and effective_let(10.0, 60.0) == pytest.approx(20.0)
+    with pytest.raises(CalibrationDataError):
+        effective_let(10.0, 75.0)
+    with pytest.raises(CalibrationDataError):
+        effective_let(10.0, -1.0)
+
+
+def write(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(textwrap.dedent(text).lstrip())
+    return p
+
+
+def test_beam_loader_applies_tilt_conventions(tmp_path):
+    p = write(tmp_path, "b.csv", """
+        # comment line ignored
+        let_mev_cm2_mg,fluence_cm2,events,tilt_deg,n_units
+
+        10,1e7,50,60,1e6
+        20,1e7,80,0,1e6
+        """)
+    ds = D.load_beam_csv(p, "sram", "ion")
+    assert ds.points[0].x == pytest.approx(20.0) and ds.points[0].fluence_cm2 == pytest.approx(5e6)
+    assert ds.points[1].x == 20.0 and ds.points[1].fluence_cm2 == 1e7 and ds.points[0].n_units == 1e6
+
+
+def test_proton_loader_and_defaults(tmp_path):
+    p = write(tmp_path, "p.csv", "energy_mev,fluence_cm2,events\n30,1e9,5\n60,1e9,9\n")
+    ds = D.load_beam_csv(p, "sram", "proton")
+    assert [pt.x for pt in ds.points] == [30.0, 60.0] and ds.points[0].n_units == 1.0
+
+
+@pytest.mark.parametrize("text,needle", [
+    ("let_mev_cm2_mg,fluence_cm2\n1,1e7\n", "missing column"),
+    ("let_mev_cm2_mg,fluence_cm2,events\n1,1e7,2.5\n", "must be an integer"),
+    ("let_mev_cm2_mg,fluence_cm2,events\n1,abc,2\n", "not a number"),
+    ("let_mev_cm2_mg,fluence_cm2,events\n1,1e7,\n", "is empty"),
+    ("let_mev_cm2_mg,fluence_cm2,events\n", "no data rows"),
+    ("let_mev_cm2_mg,fluence_cm2,events\n1,nan,3\n", "not finite"),
+])
+def test_beam_loader_rejects_bad_files_with_located_messages(tmp_path, text, needle):
+    with pytest.raises(CalibrationDataError, match=needle):
+        D.load_beam_csv(write(tmp_path, "bad.csv", text), "sram", "ion")
+
+
+def test_error_messages_name_file_and_row(tmp_path):
+    p = write(tmp_path, "named.csv", "let_mev_cm2_mg,fluence_cm2,events\n1,1e7,3\n2,xyz,4\n")
+    with pytest.raises(CalibrationDataError) as e:
+        D.load_beam_csv(p, "sram", "ion")
+    assert "named.csv" in str(e.value) and "row 3" in str(e.value) and "fluence_cm2" in str(e.value)
+
+
+def test_dataset_physical_validation():
+    for pt in (D.BeamPoint(-1, 1e7, 1), D.BeamPoint(1, 0, 1), D.BeamPoint(1, 1e7, -1), D.BeamPoint(1, 1e7, 1, 0)):
+        with pytest.raises(CalibrationDataError):
+            D.BeamDataset("x", "sram", "ion", (pt,))
+    with pytest.raises(CalibrationDataError):
+        D.BeamDataset("x", "flash", "ion", ())
+    with pytest.raises(CalibrationDataError):
+        D.load_beam_csv("/nonexistent/file.csv", "sram", "ion")
+
+
+def test_other_loaders_validate(tmp_path):
+    pw = D.load_power_csv(write(tmp_path, "p.csv", "T_k,f_ghz,v_v,util,power_w\n300,1.5,0.9,1,50\n"))
+    assert pw[0].power_w == 50.0
+    with pytest.raises(CalibrationDataError, match="impossible"):
+        D.load_power_csv(write(tmp_path, "p2.csv", "T_k,f_ghz,v_v,util,power_w\n300,1.5,0.9,1.5,50\n"))
+    rows = "\n".join(f"{i * 10},40,{i % 2},{290 + i}" for i in range(12))
+    assert len(D.load_thermal_csv(write(tmp_path, "t.csv", "t_s,power_w,eclipse,T_k\n" + rows + "\n"))) == 12
+    with pytest.raises(CalibrationDataError, match="strictly increasing"):
+        D.load_thermal_csv(write(tmp_path, "t2.csv", "t_s,power_w,eclipse,T_k\n" + "\n".join(f"{5},40,0,290" for _ in range(12)) + "\n"))
+    with pytest.raises(CalibrationDataError, match="eclipse must be"):
+        D.load_thermal_csv(write(tmp_path, "t3.csv", "t_s,power_w,eclipse,T_k\n" + "\n".join(f"{i},40,maybe,290" for i in range(12)) + "\n"))
+    with pytest.raises(CalibrationDataError, match=">= 10 samples"):
+        D.load_thermal_csv(write(tmp_path, "t4.csv", "t_s,power_w,eclipse,T_k\n1,40,0,290\n2,40,0,290\n"))
+    assert D.load_perf_csv(write(tmp_path, "f.csv", "M,K,N,dtype,sparsity,freq_ghz,latency_s\n8,8,8,int8,0.5,1.5,1e-5\n"))[0].sparsity == 0.5
+    with pytest.raises(CalibrationDataError, match="dtype"):
+        D.load_perf_csv(write(tmp_path, "f2.csv", "M,K,N,dtype,sparsity,freq_ghz,latency_s\n8,8,8,int7,0,1.5,1e-5\n"))
+    with pytest.raises(CalibrationDataError, match="sparsity"):
+        D.load_perf_csv(write(tmp_path, "f3.csv", "M,K,N,dtype,sparsity,freq_ghz,latency_s\n8,8,8,int8,0.75,1.5,1e-5\n"))
+    assert D.load_mbu_csv(write(tmp_path, "m.csv", "cluster_size,count\n1,90\n2,8\n3,2\n")).counts == {1: 90, 2: 8, 3: 2}
+    assert len(D.load_sep_csv(write(tmp_path, "s.csv", "duration_s,intensity_rel\n3600,1.2\n7200,0.7\n"), 1e7).durations_s) == 2
+    with pytest.raises(CalibrationDataError):
+        D.load_spectrum_csv(write(tmp_path, "sp.csv", "x,phi_integral\n1,1e-3\n2,1e-2\n"))     # flux increases
+    assert D.load_spectrum_csv(write(tmp_path, "sp2.csv", "x,phi_integral\n1,1e-2\n2,1e-3\n")).x == [1.0, 2.0]
+
+
+# ------------------------------------------------------------------ registry / audit
+def test_fresh_config_is_entirely_unresolved():
+    c = SimConfig(); a = placeholder_audit(c)
+    assert a.n_total > 40 and not a.resolved and len(a.unresolved) == a.n_total
+    with pytest.raises(UncalibratedError):
+        require_calibrated(c)
+
+
+def test_declare_and_record_resolve_paths():
+    c = SimConfig()
+    declare(c, "radiation.gates_per_pe", 1800, "netlist rev C")
+    assert c.radiation.gates_per_pe == 1800
+    a = placeholder_audit(c)
+    assert "radiation.gates_per_pe" in a.resolved and "radiation.gates_per_pe" not in a.unresolved
+    assert a.resolved["radiation.gates_per_pe"]["source"] == "netlist rev C"
+    require_calibrated(c, ["radiation.gates_per_pe"])                       # subset check passes
+    with pytest.raises(UncalibratedError):
+        require_calibrated(c, ["radiation.gates_per_pe", "power.base_power_w"])
+
+
+def test_accepted_placeholders_are_visible_and_strict_by_default():
+    c = SimConfig()
+    accept_placeholder(c, "power.interconnect_frac", "no layout data yet")
+    a = placeholder_audit(c)
+    assert "power.interconnect_frac" in a.accepted and c.calibration["power.interconnect_frac"]["status"] == STATUS_ACCEPTED
+    with pytest.raises(UncalibratedError):
+        require_calibrated(c, ["power.interconnect_frac"])
+    require_calibrated(c, ["power.interconnect_frac"], allow_accepted=True)
+
+
+def test_required_paths_adapt_to_config():
+    c = SimConfig()
+    assert "radiation.sel.proton.sigma_sat_cm2" not in required_paths(c)       # sigma_sat == 0: mechanism not modelled
+    assert "radiation.sram.ion.x_th" in required_paths(c)
+    assert "radiation.tmr_residual" not in required_paths(c)
+    c.radiation.tmr_enabled = True; c.memory.ecc_enabled = False
+    p = required_paths(c)
+    assert "radiation.tmr_residual" in p and "memory.ecc_bw_overhead_pct" not in p
+
+
+def test_path_helpers_and_bad_status():
+    c = SimConfig()
+    assert get_by_path(c, "radiation.sram.ion.x_th") == c.radiation.sram.ion.x_th
+    set_by_path(c, "radiation.sram.ion.x_th", 2.5); assert c.radiation.sram.ion.x_th == 2.5
+    with pytest.raises(AttributeError):
+        set_by_path(c, "radiation.not_a_thing", 1)
+    with pytest.raises(ValueError):
+        record(c, "power.base_power_w", source="x", method="y", status="vibes")
+```
+
+### `tests/test_cal_radiation.py`
+
+```python
+import math
+
+import numpy as np
+import pytest
+from scipy import stats
+
+from uchu import RadiationSubsystem, SimConfig, make_rng
+from uchu.calibration import fit_radiation as FR
+from uchu.calibration.data import (BeamDataset, BeamPoint, CalibrationDataError, MbuDataset, SepCatalog)
+from uchu.calibration.fit_radiation import (_cluster_pmf, _deviance, _mu, _nll, apply_cross_section_fit, apply_mbu_fit,
+                                            apply_sep_fit, calibrate_avf, check_table_coverage, cross_section_upper_limit,
+                                            expected_events_for_flight, fit_cross_section, fit_mbu,
+                                            fit_power_law_to_table, fit_sep_statistics, flight_update,
+                                            gamma_scale_posterior, install_environment_tables, weighted_quantile)
+from uchu.calibration.registry import placeholder_audit
+from uchu.calibration.synthetic import gen_beam
+from uchu.config import CrossSection, SpectrumTable
+from uchu.orbit import FlareSchedule, OrbitalEnvironment
+from uchu.radiation import RadiationEnvironment, TruncatedPowerLaw, integral_rate
+
+TRUTH = CrossSection(3.2e-14, 1.2, 14.0, 1.7)
+ION_X = [1.5, 2.2, 3.3, 5.0, 7.5, 11.0, 17.0, 26.0, 40.0, 60.0, 85.0]
+LAW = TruncatedPowerLaw(2e-3, 1.0, 1.6, 150.0)
+
+
+def beam(seed=1, truth=TRUTH, **kw):
+    return gen_beam(truth, "sram", "ion", "d", make_rng(seed, "d"), kw.pop("n_units", 1e8), kw.pop("x", ION_X), **kw)
+
+
+def rate(cs):
+    return integral_rate(cs, LAW, 1e-2, extra_nodes=[cs.x_th])
+
+
+# ====================================================================== likelihood pieces
+def test_deviance_matches_scipy_poisson_definition():
+    rng = make_rng(0, "dev")
+    mu = rng.uniform(0.5, 50, 12); k = rng.poisson(mu).astype(float)
+    ref = 2 * np.sum(stats.poisson.logpmf(k, np.maximum(k, 1e-300)) - stats.poisson.logpmf(k, mu))
+    assert _deviance(mu, k) == pytest.approx(ref, rel=1e-9)
+    assert _deviance(k + 1e-12, k) == pytest.approx(0.0, abs=1e-6)         # saturated model
+    assert _deviance(np.array([2.0]), np.array([0.0])) == pytest.approx(4.0)   # k=0: 2*mu
+
+
+def test_weibull_mu_matches_config_cross_section():
+    x = np.array([0.5, 1.2, 5.0, 40.0]); nF = np.array([1e8, 2e8, 1e9, 3e9])
+    th = np.array([TRUTH.sigma_sat_cm2, TRUTH.x_th, TRUTH.width, TRUTH.shape])
+    assert _mu(th, x, nF) == pytest.approx(TRUTH(x) * nF, rel=1e-12)
+
+
+# ====================================================================== cross-section fit
+def test_recovers_parameters_when_counts_are_abundant():
+    ds = beam(target_events=2e5, f_max=1e13, f_min=1e5)
+    f = fit_cross_section(ds, make_rng(2, "f"), n_boot=20)
+    for k, v in (("sigma_sat_cm2", TRUTH.sigma_sat_cm2), ("x_th", TRUTH.x_th), ("width", TRUTH.width), ("shape", TRUTH.shape)):
+        assert f.params[k] == pytest.approx(v, rel=0.03), k
+    assert f.p_value > 0.01 and not f.overdispersed
+
+
+def test_mle_is_at_least_as_likely_as_the_truth_and_deterministic():
+    for seed in range(8):
+        ds = beam(seed)
+        f = fit_cross_section(ds, make_rng(5, "f"), n_boot=10)
+        x = np.array([p.x for p in ds.points]); nF = np.array([p.n_units * p.fluence_cm2 for p in ds.points])
+        k = np.array([p.events for p in ds.points], float)
+        th_t = np.array([TRUTH.sigma_sat_cm2, TRUTH.x_th, TRUTH.width, TRUTH.shape])
+        th_h = np.array([f.params[p] for p in ("sigma_sat_cm2", "x_th", "width", "shape")])
+        assert _nll(_mu(th_h, x, nF), k) <= _nll(_mu(th_t, x, nF), k) + 1e-6
+    a = fit_cross_section(beam(3), make_rng(9, "f"), n_boot=15)
+    b = fit_cross_section(beam(3), make_rng(9, "f"), n_boot=15)
+    assert a.params == b.params and np.array_equal(a.samples, b.samples)
+
+
+def test_predicted_rate_is_better_constrained_than_individual_parameters():
+    f = fit_cross_section(beam(11), make_rng(2, "f"), n_boot=80)
+    rs = np.array([rate(f.draw(i)) for i in range(len(f.samples))])
+    rel_rate = (np.percentile(rs, 97.5) - np.percentile(rs, 2.5)) / np.median(rs)
+    lo, hi = f.ci95["x_th"]
+    assert rel_rate < 1.0 and (hi / lo) > 3.0            # x_th spans a big factor, the rate does not
+    assert np.percentile(rs, 2.5) <= rate(TRUTH) <= np.percentile(rs, 97.5)
+
+
+def test_fixed_shape_is_honoured_and_recorded_as_derived():
+    c = SimConfig()
+    f = fit_cross_section(beam(4), make_rng(2, "f"), n_boot=15, fix={"shape": 2.0})
+    assert f.params["shape"] == 2.0 and f.ci95["shape"] == (2.0, 2.0) and np.all(f.samples[:, 3] == 2.0)
+    apply_cross_section_fit(c, f)
+    assert c.calibration["radiation.sram.ion.shape"]["status"] == "derived"
+    assert c.calibration["radiation.sram.ion.sigma_sat_cm2"]["status"] == "measured"
+
+
+def test_apply_updates_config_ledger_and_audit():
+    c = SimConfig(); f = fit_cross_section(beam(4), make_rng(2, "f"), n_boot=15)
+    apply_cross_section_fit(c, f, source="beam run 2025-03")
+    assert c.radiation.sram.ion.sigma_sat_cm2 == f.params["sigma_sat_cm2"]
+    e = c.calibration["radiation.sram.ion.width"]
+    assert e["source"] == "beam run 2025-03" and e["ci95"][0] <= f.params["width"] <= e["ci95"][1]
+    a = placeholder_audit(c)
+    assert all(f"radiation.sram.ion.{p}" in a.resolved for p in ("sigma_sat_cm2", "x_th", "width", "shape"))
+    assert "radiation.sram.proton.x_th" in a.unresolved
+
+
+def test_insufficient_or_empty_data_is_refused_with_an_upper_limit():
+    pts = tuple(BeamPoint(x, 1e7, 0, 1e6) for x in ION_X)
+    with pytest.raises(CalibrationDataError, match="upper limit"):
+        fit_cross_section(BeamDataset("z", "sram", "ion", pts), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match=">= 4"):
+        fit_cross_section(BeamDataset("z", "sram", "ion", pts[:3]), make_rng(0, "f"))
+    assert cross_section_upper_limit(0, 1e7, 1e6) == pytest.approx(2.9957 / 1e13, rel=1e-3)
+    assert cross_section_upper_limit(5, 1e7, 1e6) > cross_section_upper_limit(0, 1e7, 1e6)
+
+
+def test_overdispersion_is_detected_and_intervals_widen():
+    rng = make_rng(8, "od")
+    pts_p, pts_o = [], []
+    for x in ION_X:
+        sig = float(TRUTH(x)); nF = 1e8 * 3e7
+        mu = sig * nF
+        pts_p.append(BeamPoint(x, 3e7, int(rng.poisson(mu)), 1e8))
+        pts_o.append(BeamPoint(x, 3e7, int(rng.poisson(mu * rng.lognormal(0, 0.6))), 1e8))     # 60 % fluence/dosimetry scatter
+    fp = fit_cross_section(BeamDataset("p", "sram", "ion", tuple(pts_p)), make_rng(1, "f"), n_boot=60)
+    fo = fit_cross_section(BeamDataset("o", "sram", "ion", tuple(pts_o)), make_rng(1, "f"), n_boot=60)
+    assert not fp.overdispersed and fo.overdispersed and fo.p_value < 0.05 and fo.dispersion > 2.0
+    assert any("over-dispersed" in w for w in fo.warnings)
+    wp = np.percentile(fp.samples[:, 0], 97.5) / np.percentile(fp.samples[:, 0], 2.5)
+    wo = np.percentile(fo.samples[:, 0], 97.5) / np.percentile(fo.samples[:, 0], 2.5)
+    assert wo > 1.3 * wp
+
+
+def test_warns_when_saturation_is_not_reached_and_when_underdetermined():
+    f = fit_cross_section(beam(3, x=[1.5, 2.2, 3.3, 5.0, 7.5, 11.0, 17.0], n_units=1e9), make_rng(2, "f"), n_boot=30)
+    assert any("saturation not reached" in w for w in f.warnings)
+    full = fit_cross_section(beam(3), make_rng(2, "f"), n_boot=30)             # data extend to 85 MeV cm2/mg
+    assert not any("saturation not reached" in w for w in full.warnings)
+    pts = tuple(BeamPoint(x, 1e7, int(c), 1e8) for x, c in zip((10, 10, 40, 40), (5, 6, 30, 28)))
+    f2 = fit_cross_section(BeamDataset("u", "sram", "ion", tuple(pts)), make_rng(2, "f"), n_boot=30)
+    assert any("distinct x values" in w for w in f2.warnings)
+
+
+# ---- statistical validity of the intervals and of the goodness-of-fit p-value
+@pytest.mark.slow
+def test_bootstrap_interval_coverage_and_gof_calibration():
+    R, hit_rate, hit_sig, ps = 30, 0, 0, []
+    rt = rate(TRUTH)
+    for i in range(R):
+        f = fit_cross_section(beam(100 + i), make_rng(200 + i, "f"), n_boot=50)
+        rs = np.array([rate(f.draw(j)) for j in range(len(f.samples))])
+        hit_rate += np.percentile(rs, 2.5) <= rt <= np.percentile(rs, 97.5)
+        lo, hi = f.ci95["sigma_sat_cm2"]; hit_sig += lo <= TRUTH.sigma_sat_cm2 <= hi
+        ps.append(f.p_value)
+    ps = np.array(ps)
+    # measured on 40 repeats: rate 0.93, sigma_sat 0.88 (percentile bootstrap undercovers slightly), p-values ~ uniform
+    assert hit_rate / R >= 0.80 and hit_sig / R >= 0.75
+    assert 0.3 < ps.mean() < 0.7 and (ps < 0.05).mean() <= 0.2
+
+
+# ====================================================================== MBU
+def test_cluster_pmf_is_a_distribution_and_matches_the_simulator():
+    for q, M in ((0.45, 5), (0.2, 8), (0.9, 3), (1.0, 4)):
+        pmf = _cluster_pmf(q, M); assert pmf.sum() == pytest.approx(1.0) and np.all(pmf >= 0)
+    c = SimConfig(); c.radiation.mbu_cluster_geom_p, c.radiation.mbu_max_cluster = 0.45, 5
+    sizes = RadiationSubsystem(c.validate(), None, make_rng(3, "m"))._cluster_sizes(400_000)
+    emp = np.bincount(sizes, minlength=6)[2:] / len(sizes)
+    assert emp == pytest.approx(_cluster_pmf(0.45, 5), abs=0.004)              # fit model == simulator model
+
+
+def _mbu_counts(rng, N, p, q, M):
+    pmf = np.concatenate([[1 - p], p * _cluster_pmf(q, M)])
+    s = rng.choice(np.arange(1, M + 1), size=N, p=pmf)
+    return {int(m): int((s == m).sum()) for m in range(1, M + 1)}
+
+
+def test_mbu_fit_recovers_parameters_and_passes_gof():
+    ds = MbuDataset("m", _mbu_counts(make_rng(1, "m"), 50_000, 0.18, 0.45, 5))
+    f = fit_mbu(ds, make_rng(2, "f"), max_cluster=5)
+    assert f.p_mbu == pytest.approx(0.18, abs=0.006) and f.geom_p == pytest.approx(0.45, abs=0.02)
+    assert f.p_mbu_ci95[0] < 0.18 < f.p_mbu_ci95[1] and f.geom_p_ci95[0] < 0.45 < f.geom_p_ci95[1]
+    assert f.chi2_p_value > 0.01 and f.max_cluster == 5
+    assert 0 < f.p_samples.min() and f.q_samples.max() < 1 and len(f.p_samples) == 500
+
+
+def test_mbu_interval_coverage():
+    rng = make_rng(3, "cov"); hp = hq = 0; R = 300
+    for _ in range(R):
+        f = fit_mbu(MbuDataset("m", _mbu_counts(rng, 800, 0.18, 0.45, 5)), make_rng(0, "f"), max_cluster=5)
+        hp += f.p_mbu_ci95[0] <= 0.18 <= f.p_mbu_ci95[1]; hq += f.geom_p_ci95[0] <= 0.45 <= f.geom_p_ci95[1]
+    assert hp / R >= 0.92 and hq / R >= 0.90
+
+
+def test_mbu_refuses_thin_data_and_warns_about_truncation():
+    with pytest.raises(CalibrationDataError, match=">= 20"):
+        fit_mbu(MbuDataset("m", {1: 10, 2: 3}), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match="multi-bit"):
+        fit_mbu(MbuDataset("m", {1: 500, 2: 2}), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match="max_cluster"):
+        fit_mbu(MbuDataset("m", {1: 500, 2: 40, 7: 5}), make_rng(0, "f"), max_cluster=5)
+    f = fit_mbu(MbuDataset("m", {1: 800, 2: 120, 3: 40, 4: 20}), make_rng(0, "f"))
+    assert any("truncation" in w for w in f.warnings)
+
+
+def test_apply_mbu_updates_the_simulator_parameters():
+    c = SimConfig(); f = fit_mbu(MbuDataset("m", _mbu_counts(make_rng(1, "m"), 5000, 0.2, 0.4, 6)), make_rng(2, "f"))
+    apply_mbu_fit(c, f)
+    assert (c.radiation.mbu_prob, c.radiation.mbu_cluster_geom_p, c.radiation.mbu_max_cluster) == (f.p_mbu, f.geom_p, f.max_cluster)
+    assert c.calibration["radiation.mbu_max_cluster"]["status"] == "derived"
+    c.validate()
+
+
+# ====================================================================== SEP
+def _catalog(rng, years, rate, mean_dur, med, sig):
+    n = int(rng.poisson(rate * years))
+    return SepCatalog("s", years * 365.25 * 86400.0, tuple(rng.exponential(mean_dur, n)),
+                      tuple(rng.lognormal(math.log(med), sig, n)))
+
+
+def test_sep_fit_recovers_parameters():
+    cat = _catalog(make_rng(1, "s"), 2000.0, 4.0, 30 * 3600.0, 0.8, 1.3)
+    f = fit_sep_statistics(cat, make_rng(2, "f"))
+    assert f.rate_per_year == pytest.approx(4.0, rel=0.03) and f.mean_duration_s == pytest.approx(30 * 3600.0, rel=0.03)
+    assert f.median_intensity == pytest.approx(0.8, rel=0.03) and f.log_sigma == pytest.approx(1.3, rel=0.03)
+    for est, ci in ((f.rate_per_year, f.rate_ci95), (f.mean_duration_s, f.duration_ci95), (f.median_intensity, f.median_ci95), (f.log_sigma, f.log_sigma_ci95)):
+        assert ci[0] < est < ci[1]
+    assert f.samples.shape == (500, 4) and np.all(f.samples > 0)
+
+
+def test_sep_interval_coverage():
+    rng = make_rng(4, "cov"); hr = hd = hs = 0; R = 300
+    for _ in range(R):
+        f = fit_sep_statistics(_catalog(rng, 12.0, 4.0, 30 * 3600.0, 0.8, 1.3), make_rng(0, "f"), n_draw=10)
+        hr += f.rate_ci95[0] <= 4.0 <= f.rate_ci95[1]; hd += f.duration_ci95[0] <= 30 * 3600.0 <= f.duration_ci95[1]
+        hs += f.log_sigma_ci95[0] <= 1.3 <= f.log_sigma_ci95[1]
+    assert min(hr, hd, hs) / R >= 0.92
+
+
+def test_sep_small_catalogues():
+    with pytest.raises(CalibrationDataError, match=">= 3"):
+        fit_sep_statistics(SepCatalog("s", 1e8, (1.0, 2.0), (1.0, 2.0)), make_rng(0, "f"))
+    f = fit_sep_statistics(SepCatalog("s", 3e8, (3600.0, 7200.0, 1800.0, 5400.0), (0.5, 1.5, 0.9, 2.0)), make_rng(0, "f"))
+    assert any("only 4 SEP events" in w for w in f.warnings)
+
+
+def test_apply_sep_drives_the_flare_schedule():
+    c = SimConfig(); cat = _catalog(make_rng(1, "s"), 500.0, 6.0, 20 * 3600.0, 1.5, 0.5)
+    f = fit_sep_statistics(cat, make_rng(2, "f")); apply_sep_fit(c, f)
+    o = OrbitalEnvironment(c.validate().orbital, make_rng(3, "o")); o.flares.extend_to(100 * 365.25 * 86400.0)
+    ev = o.flares.events
+    assert len(ev) == pytest.approx(100 * f.rate_per_year, rel=0.12)
+    assert np.median([e[2] for e in ev]) == pytest.approx(f.median_intensity, rel=0.1)
+    assert c.calibration["orbital.sep_events_per_year"]["method"].startswith("Poisson")
+
+
+# ====================================================================== spectra
+def test_power_law_fit_recovers_a_truncated_power_law_table():
+    x = np.geomspace(1e-2, 149.0, 300)
+    tab = SpectrumTable(x.tolist(), LAW.integral(x).tolist())
+    r = fit_power_law_to_table(tab, x_hi=150.0)
+    assert r.params.phi_ref == pytest.approx(2e-3, rel=0.01) and r.params.gamma == pytest.approx(1.6, rel=0.01)
+    assert r.max_rel_error < 0.01 and not r.warnings
+    cs = CrossSection(1e-14, 0.5, 20.0, 1.5)
+    law2 = TruncatedPowerLaw(r.params.phi_ref, r.params.x_ref, r.params.gamma, r.params.x_max)
+    assert integral_rate(cs, law2, 1e-2, extra_nodes=[0.5]) == pytest.approx(integral_rate(cs, LAW, 1e-2, extra_nodes=[0.5]), rel=0.02)
+
+
+def test_power_law_fit_warns_when_the_table_is_not_a_power_law():
+    x = np.geomspace(0.1, 100, 80)
+    phi = np.where(x < 5, 1e-2 * (x / 0.1) ** -0.3, 1e-2 * (50) ** -0.3 * (x / 5) ** -3.0)
+    r = fit_power_law_to_table(SpectrumTable(x.tolist(), phi.tolist()))
+    assert r.max_rel_error > 0.3 and any("use the table directly" in w for w in r.warnings)
+    with pytest.raises(CalibrationDataError):
+        fit_power_law_to_table(SpectrumTable([1.0, 2.0, 3.0], [3.0, 2.0, 1.0]))
+
+
+def test_install_tables_switches_mode_and_records_provenance():
+    c = SimConfig(); x = np.geomspace(1e-2, 149.0, 200)
+    tabs = {"gcr_ion": SpectrumTable(x.tolist(), LAW.integral(x).tolist())}
+    assert install_environment_tables(c, tabs, "CREME96 run A") == []
+    assert c.radiation.environment_mode == "tabulated_orbit"
+    a = placeholder_audit(c)
+    assert {"radiation.environment", "radiation.shield_mm_al", "radiation.shield_atten_len_mm"} <= set(a.resolved)
+    assert c.calibration["radiation.shield_mm_al"]["status"] == "absorbed"
+    # GCR-only table: the rate equals the analytic GCR integral
+    o = OrbitalEnvironment(c.orbital); o.flares = FlareSchedule.from_events([])
+    env = RadiationEnvironment(c, o)
+    ref = integral_rate(c.radiation.sram.ion, LAW, 1e-2, extra_nodes=[c.radiation.sram.ion.x_th])
+    assert env.static_rate["sram"] == pytest.approx(ref, rel=0.03, abs=0)
+
+
+def test_table_coverage_warning_when_flux_below_threshold_is_missing():
+    c = SimConfig()
+    late = SpectrumTable([5.0, 10.0, 50.0], [1e-3, 1e-4, 1e-6])
+    w = install_environment_tables(c, {"gcr_ion": late}, "late table")
+    assert w and "above" in w[0] and "non-conservative" in w[0]
+    assert check_table_coverage(c, {"gcr_ion": SpectrumTable([0.01, 10.0], [1e-1, 1e-6])}) == []
+
+
+# ====================================================================== flight data
+def test_flight_update_matches_the_conjugate_gamma_posterior():
+    a, E0, k = 6.0, 40.0, 61
+    s = make_rng(1, "s").gamma(a, 1.0 / a, 60_000)                    # prior multiplier ~ Gamma(a, rate a), mean 1
+    fu = flight_update(E0 * s, k)
+    post = stats.gamma(a + k, scale=1.0 / (a + E0))                   # exact posterior (Poisson-Gamma conjugacy)
+    assert fu.posterior_multiplier_median == pytest.approx(post.median(), rel=0.02)
+    lo, hi = post.ppf([0.025, 0.975])
+    assert fu.posterior_multiplier_ci95[0] == pytest.approx(lo, rel=0.05) and fu.posterior_multiplier_ci95[1] == pytest.approx(hi, rel=0.05)
+    assert fu.weights.sum() == pytest.approx(1.0) and fu.p_consistency > 0.05
+
+
+def test_flight_update_flags_inconsistent_data_and_discrepancy_term_helps():
+    E = make_rng(2, "E").lognormal(math.log(50.0), 0.15, 400)
+    bad = flight_update(E, 500)
+    assert bad.p_consistency < 0.01 and any("inconsistent" in w for w in bad.warnings)
+    soft = flight_update(E, 500, discrepancy_log_sigma=1.5)
+    assert soft.p_consistency > bad.p_consistency and soft.ess > bad.ess
+    ok = flight_update(E, 51)
+    assert ok.p_consistency > 0.3 and not ok.warnings or ok.ess > 20
+    assert flight_update(E, 51, discrepancy_log_sigma=0.4).weights.sum() == pytest.approx(1.0)
+
+
+def test_weights_pull_posterior_towards_the_flight_count():
+    E = np.linspace(30, 90, 300)
+    fu = flight_update(E, 75)
+    post_mean = np.sum(fu.weights * E)
+    assert 70 < post_mean < 80 and fu.ess < 300
+
+
+def test_weighted_quantile_matches_numpy_for_uniform_weights():
+    v = make_rng(0, "q").normal(size=2001)
+    assert weighted_quantile(v, np.ones_like(v), [0.1, 0.5, 0.9]) == pytest.approx(np.quantile(v, [0.1, 0.5, 0.9]), abs=0.01)
+    w = np.where(v > 0, 1.0, 0.0)
+    assert weighted_quantile(v, w, [0.5])[0] > 0.3
+
+
+def test_gamma_scale_posterior_closed_form_and_coverage():
+    m, (lo, hi) = gamma_scale_posterior(20, 10.0)
+    assert m == pytest.approx(20.5 / 10.0) and lo < 2.0 < hi
+    rng = make_rng(1, "g"); R = 600; hit = 0
+    for _ in range(R):
+        k = int(rng.poisson(1.7 * 25.0)); _, (a, b) = gamma_scale_posterior(k, 25.0); hit += a <= 1.7 <= b
+    assert hit / R >= 0.93
+
+
+def test_expected_events_for_flight_is_linear_and_flare_exact():
+    c = SimConfig().validate()
+    segs = ((0.0, 1e5), (2e5, 3e5))
+    base = expected_events_for_flight(c, "sram", 1e8, segs)
+    assert expected_events_for_flight(c, "sram", 2e8, segs) == pytest.approx(2 * base, rel=1e-12)
+    assert expected_events_for_flight(c, "sram", 1e8, ((0.0, 2e5),)) == pytest.approx(2 * expected_events_for_flight(c, "sram", 1e8, ((0.0, 1e5),)), rel=1e-12)
+    withfl = expected_events_for_flight(c, "sram", 1e8, segs, ((0.0, 1e4, 2.0),))
+    env = RadiationEnvironment(c, OrbitalEnvironment(c.orbital))
+    assert withfl - base == pytest.approx(1e8 * env.sep_coeff["sram"] * 2.0 * 1e4, rel=1e-9)
+    assert expected_events_for_flight(c, "sram", 1e8, ((1e5, 2e5),), ((0.0, 1e4, 2.0),)) == pytest.approx(
+        expected_events_for_flight(c, "sram", 1e8, ((1e5, 2e5),)), rel=1e-12)      # flare outside the monitored window
+
+
+# ====================================================================== AVF
+def test_calibrate_avf_conservative_vs_point_estimate():
+    c1, c2 = SimConfig(), SimConfig()
+    r1 = calibrate_avf(c1, trials_per_bit=30, seed=1, conservative=True)
+    r2 = calibrate_avf(c2, trials_per_bit=30, seed=1, conservative=False)
+    assert c2.radiation.avf_sram == pytest.approx(r2.avf) and c1.radiation.avf_sram == pytest.approx(r1.ci_high)
+    assert c1.radiation.avf_sram >= c2.radiation.avf_sram and 0 < c2.radiation.avf_sram < 1
+    e = c1.calibration["radiation.avf_sram"]
+    assert e["status"] == "measured" and e["ci95"][0] <= e["ci95"][1] and "fault injection" in e["method"].lower()
+    with pytest.raises(ValueError, match="RTL"):
+        calibrate_avf(c1, "avf_register")
+```
+
+### `tests/test_cal_hardware.py`
+
+```python
+import math
+
+import numpy as np
+import pytest
+
+from uchu import DType, LumpedThermalModel, PowerModel, SimConfig, make_rng
+from uchu.calibration import fit_hardware as FH
+from uchu.calibration.data import CalibrationDataError, PerfMeasurement, PowerMeasurement, ThermalSample
+from uchu.calibration.fit_hardware import (apply_perf_fit, apply_power_fit, apply_thermal_fit, design_coverage,
+                                           fit_performance, fit_power_model, fit_thermal_model, integrate_thermal,
+                                           power_to_config_values, regime_counts, suggest_gemm_shapes,
+                                           suggest_power_design, thermal_to_config_values)
+from uchu.calibration.registry import placeholder_audit
+from uchu.calibration.synthetic import analyst_start_config, gen_perf, gen_power, gen_thermal, make_truth_config
+from uchu.config import OrbitalConfig, OrbitType, ProcessNode
+from uchu.memory import WorkloadLayer, estimate_layer
+from uchu.thermal import SIGMA_SB
+
+TRUTH = make_truth_config()
+
+
+def near(ci, est, truth, k=3.5):
+    """Single-seed check: the estimate is within k standard errors of the truth (se from the 95 % interval).
+    Nominal-coverage claims are tested statistically in the *_coverage tests, not by asserting every interval."""
+    se = (ci[1] - ci[0]) / (2 * 1.96)
+    assert abs(est - truth) <= k * se + 1e-15, f"|{est} - {truth}| > {k} se ({se})"
+
+
+# ====================================================================== power
+def test_power_design_is_well_conditioned_and_exactly_recovered_without_noise():
+    meas = gen_power(TRUTH, make_rng(1, "p"), rel_noise=0.0)
+    f = fit_power_model(meas, SimConfig(), make_rng(2, "f"))
+    assert f.config_values["base_power_w"] == pytest.approx(63.0, rel=1e-6)
+    assert f.config_values["static_frac"] == pytest.approx(0.38, rel=1e-6)
+    assert f.config_values["leak_temp_coeff"] == pytest.approx(3.1, rel=1e-5)
+    assert f.config_values["clock_frac"] == pytest.approx(0.12, rel=1e-4)
+    assert f.rel_rms_error < 1e-9 and f.cond < 1e3
+
+
+def test_power_fit_with_noise_brackets_truth_and_reproduces_the_model():
+    f = fit_power_model(gen_power(TRUTH, make_rng(3, "p"), 0.01), SimConfig(), make_rng(2, "f"))
+    for k, v in (("base_power_w", 63.0), ("static_frac", 0.38), ("leak_temp_coeff", 3.1), ("clock_frac", 0.12)):
+        near(f.ci95[k], f.config_values[k], v)
+    assert 0.003 < f.rel_rms_error < 0.02                       # ~ the injected 1 % noise
+    c = SimConfig(); apply_power_fit(c, f, "bench"); c.validate()
+    pm_fit, pm_true = PowerModel(c), PowerModel(TRUTH)
+    for T, fr, v, u in ((300, 1.5, 0.9, 1.0), (350, 0.9, 0.72, 0.4), (330, 1.2, 0.8, 0.0)):
+        assert pm_fit.power_w(T, fr, v, u) == pytest.approx(pm_true.power_w(T, fr, v, u), rel=0.03)
+    assert c.calibration["power.base_power_w"]["status"] == "measured"
+    assert "power.interconnect_frac" in placeholder_audit(c).unresolved           # honestly NOT claimed
+
+
+def test_power_inversion_is_exact_for_a_non_reference_chip():
+    t = SimConfig(); t.compute.array_size = 128; t.compute.area_mm2 = 250.0; t.compute.process_node = ProcessNode.N5
+    t.dvfs.nom_voltage_v = 0.85; t.power.base_power_w = 48.0; t.power.static_frac = 0.33
+    pm = PowerModel(t)
+    meas = [PowerMeasurement(d["T_k"], 1.5 * d["f_frac"], 0.85 * d["v_frac"], d["util"],
+                             pm.power_w(d["T_k"], 1.5 * d["f_frac"], 0.85 * d["v_frac"], d["util"])) for d in suggest_power_design()]
+    start = SimConfig(); start.compute = type(t.compute)(**vars(t.compute)); start.dvfs.nom_voltage_v = 0.85
+    f = fit_power_model(meas, start, make_rng(2, "f"))
+    assert f.config_values["base_power_w"] == pytest.approx(48.0, rel=1e-6) and f.config_values["static_frac"] == pytest.approx(0.33, rel=1e-6)
+    assert power_to_config_values(t, pm.static_nom_w, pm.dynamic_nom_w) == pytest.approx((48.0, 0.33))
+    apply_power_fit(start, f, "bench")
+    pm2 = PowerModel(start)
+    assert pm2.static_nom_w == pytest.approx(pm.static_nom_w, rel=1e-6) and pm2.dynamic_nom_w == pytest.approx(pm.dynamic_nom_w, rel=1e-6)
+
+
+def test_power_fit_refuses_unidentifiable_and_too_small_designs():
+    one = [PowerMeasurement(300.0, 1.5, 0.9, 1.0, 50.0 + 0.01 * i) for i in range(12)]    # same operating point repeated
+    with pytest.raises(CalibrationDataError, match="cannot identify"):
+        fit_power_model(one, SimConfig(), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match=">= 8"):
+        fit_power_model(gen_power(TRUTH, make_rng(1, "p"))[:7], SimConfig(), make_rng(0, "f"))
+
+
+@pytest.mark.slow
+def test_power_wald_interval_coverage():
+    R, hit = 40, {"base_power_w": 0, "static_frac": 0, "leak_temp_coeff": 0}
+    tv = {"base_power_w": 63.0, "static_frac": 0.38, "leak_temp_coeff": 3.1}
+    for i in range(R):
+        f = fit_power_model(gen_power(TRUTH, make_rng(500 + i, "p"), 0.01), SimConfig(), make_rng(i, "f"), n_draw=300)
+        for k in hit:
+            hit[k] += f.ci95[k][0] <= tv[k] <= f.ci95[k][1]
+    assert all(v / R >= 0.82 for v in hit.values()), hit
+
+
+# ====================================================================== thermal
+def test_newton_integrator_matches_lumped_model_exactly():
+    c = SimConfig(); th = LumpedThermalModel(c); th.T = 285.0
+    orb_t = np.arange(0, 6000 + 1, 30.0); P = 30 + 20 * np.sin(orb_t / 400.0) ** 2
+    ecl = (orb_t % 5739.0) < 2100.0
+    ref = [285.0]
+    for i in range(1, len(orb_t)):
+        th.step(30.0, lambda T, p=P[i]: p, bool(ecl[i])); ref.append(th.T)
+    kr = c.thermal.emissivity * SIGMA_SB * c.thermal.view_factor * c.thermal.radiator_area_m2
+    mine = integrate_thermal(c.thermal.capacitance_j_per_k, kr, th.env_load_w(False), th.env_load_w(True), orb_t, P, ecl, 285.0)
+    assert mine == pytest.approx(np.array(ref), abs=1e-7)
+
+
+def test_thermal_fit_recovers_truth_and_reproduces_telemetry():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    f = fit_thermal_model(tel, SimConfig(), make_rng(2, "f"))
+    tv = {"capacitance_j_per_k": 320.0, "radiator_area_m2": 0.21, "earth_view_fraction": 0.32, "sun_projected_fraction": 0.22}
+    for k, v in tv.items():
+        near(f.ci95[k], f.config_values[k], v)
+        assert f.config_values[k] == pytest.approx(v, rel=0.03), k
+    assert f.rms_K == pytest.approx(0.3, abs=0.05) and f.cond < 1e4 and f.fixed == []
+    c = SimConfig(); apply_thermal_fit(c, f, "flight telemetry")
+    # the calibrated config reproduces the loads and radiation coefficient that were fitted
+    lm = LumpedThermalModel(c)
+    assert lm.env_load_w(False) == pytest.approx(f.Q_sun, rel=1e-9) and lm.env_load_w(True) == pytest.approx(f.Q_ecl, rel=1e-9)
+    assert lm.radiated_w(300.0) == pytest.approx(f.kr * 300.0 ** 4, rel=1e-9)
+    st = placeholder_audit(c)
+    assert "thermal.albedo_geometry" in st.resolved and c.calibration["thermal.albedo_geometry"]["status"] == "absorbed"
+
+
+def test_thermal_fit_without_eclipse_leaves_those_parameters_unresolved():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    k0 = next(i for i, r in enumerate(tel) if i > 0 and not r.eclipse)
+    k1 = next(i for i in range(k0, len(tel)) if tel[i].eclipse)
+    sunlit = [ThermalSample(r.t_s - tel[k0 - 1].t_s, r.power_w, False, r.T_k) for r in tel[k0 - 1:k1]]
+    sunlit[0] = ThermalSample(0.0, 0.0, False, sunlit[0].T_k)
+    f = fit_thermal_model(sunlit, SimConfig(), make_rng(2, "f"))
+    assert f.fixed == ["Q_ecl"] and any("no eclipse samples" in w for w in f.warnings)
+    c = SimConfig(); before = c.thermal.earth_view_fraction
+    apply_thermal_fit(c, f, "partial telemetry")
+    assert c.thermal.earth_view_fraction == before and "thermal.earth_view_fraction" in placeholder_audit(c).unresolved
+
+
+def test_thermal_fit_refuses_uninformative_telemetry():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    flat = [ThermalSample(r.t_s, 40.0, r.eclipse, r.T_k) for r in tel]           # constant power: C not identifiable
+    with pytest.raises(CalibrationDataError, match="cannot identify"):
+        fit_thermal_model(flat, SimConfig(), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match=">= 20"):
+        fit_thermal_model(tel[:10], SimConfig(), make_rng(0, "f"))
+
+
+def test_thermal_mapping_inverts_the_forward_model_exactly():
+    c = SimConfig(); c.thermal.capacitance_j_per_k, c.thermal.radiator_area_m2 = 280.0, 0.18
+    c.thermal.earth_view_fraction, c.thermal.sun_projected_fraction = 0.3, 0.2
+    lm = LumpedThermalModel(c)
+    kr = c.thermal.emissivity * SIGMA_SB * c.thermal.view_factor * c.thermal.radiator_area_m2
+    v, w = thermal_to_config_values(SimConfig(), 280.0, kr, lm.env_load_w(False), lm.env_load_w(True))
+    assert not w
+    assert v["radiator_area_m2"] == pytest.approx(0.18, rel=1e-12) and v["earth_view_fraction"] == pytest.approx(0.3, rel=1e-12)
+    assert v["sun_projected_fraction"] == pytest.approx(0.2, rel=1e-12) and v["capacitance_j_per_k"] == 280.0
+
+
+def test_thermal_mapping_clamps_and_warns_on_unphysical_loads():
+    c = SimConfig(); kr = 1.0e-8                                          # ~0.244 m2 radiator
+    v, w = thermal_to_config_values(c, 300.0, kr, 1.0, 50.0)              # sunlit load < eclipse load
+    assert v["sun_projected_fraction"] == 0.0 and any("clamped" in x for x in w)
+    v, w = thermal_to_config_values(c, 300.0, kr, 80.0, 5000.0)           # eclipse load implies Earth fraction > 1
+    assert v["earth_view_fraction"] == 1.0 and any("Earth view fraction" in x for x in w)
+    v, w = thermal_to_config_values(c, 300.0, kr, 900.0, 10.0)            # absurd sunlit load
+    assert v["sun_projected_fraction"] > 1.0 and any("> 1" in x for x in w)
+    d = SimConfig(); d.orbital = OrbitalConfig.for_orbit(OrbitType.DEEP)
+    v, w = thermal_to_config_values(d, 300.0, 2e-9, 15.0, 0.0)
+    assert "earth_view_fraction" not in v and any("heat source" in x for x in w)
+
+
+@pytest.mark.slow
+def test_thermal_and_perf_interval_coverage():
+    R = 25
+    th_hit = {"capacitance_j_per_k": 0, "radiator_area_m2": 0, "earth_view_fraction": 0, "sun_projected_fraction": 0}
+    th_true = {"capacitance_j_per_k": 320.0, "radiator_area_m2": 0.21, "earth_view_fraction": 0.32, "sun_projected_fraction": 0.22}
+    start = analyst_start_config(TRUTH)
+    pf_hit = {"pipeline_overlap": 0, "hbm_efficiency": 0, "sparse_speedup_at_50": 0}
+    pf_true = {"pipeline_overlap": 0.6, "hbm_efficiency": 0.72, "sparse_speedup_at_50": 1.7}
+    for i in range(R):
+        f = fit_thermal_model(gen_thermal(TRUTH, make_rng(700 + i, "t")), SimConfig(), make_rng(i, "f"), n_draw=300)
+        for k in th_hit:
+            th_hit[k] += f.ci95[k][0] <= th_true[k] <= f.ci95[k][1]
+        g = fit_performance(gen_perf(TRUTH, start, make_rng(800 + i, "c")), start, make_rng(i, "f"), n_draw=300)
+        for k in pf_hit:
+            pf_hit[k] += g.ci95[k][0] <= pf_true[k] <= g.ci95[k][1]
+    assert all(v / R >= 0.80 for v in th_hit.values()), th_hit
+    assert all(v / R >= 0.80 for v in pf_hit.values()), pf_hit
+
+
+def test_radiator_area_maps_from_radiation_coefficient_with_degradation():
+    c = SimConfig(); c.thermal.mission_year = 10.0
+    v, _ = thermal_to_config_values(c, 300.0, 3e-9, 40.0, 10.0)
+    F = 0.85 * (1 - 0.02 * 10.0)
+    assert v["radiator_area_m2"] == pytest.approx(3e-9 / (SIGMA_SB * 0.85 * F), rel=1e-12)
+
+
+# ====================================================================== performance
+def _measure(truth, start, seed, shapes=None, **kw):
+    return gen_perf(truth, start, make_rng(seed, "c"), shapes=shapes, **kw)
+
+
+def test_perf_fit_recovers_all_three_parameters_and_launch_overhead():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5), start, make_rng(4, "f"))
+    tv = {"pipeline_overlap": 0.6, "hbm_efficiency": 0.72, "sparse_speedup_at_50": 1.7}
+    for k, v in tv.items():
+        near(f.ci95[k], f.params[k], v)
+        assert f.params[k] == pytest.approx(v, rel=0.08), k
+    assert f.t_launch_s == pytest.approx(8e-6, rel=0.2) and f.fixed == [] and f.cond < 100
+    assert f.log_rms == pytest.approx(0.02, abs=0.005)               # residual ~ the injected 2 % noise: no hidden bias
+
+
+def test_perf_fit_noise_free_is_exact():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5, log_noise=0.0), start, make_rng(4, "f"))
+    assert f.params["pipeline_overlap"] == pytest.approx(0.6, rel=1e-3) and f.params["hbm_efficiency"] == pytest.approx(0.72, rel=1e-3)
+    assert f.params["sparse_speedup_at_50"] == pytest.approx(1.7, rel=1e-3) and f.t_launch_s == pytest.approx(8e-6, rel=1e-2)
+    assert f.log_rms < 1e-3                                           # exact data => (near-)zero residual
+
+
+def test_missing_regime_is_left_unresolved_not_guessed():
+    start = analyst_start_config(TRUTH)
+    dense_only = [s for s in suggest_gemm_shapes(start) if s["sparsity"] == 0.0]
+    f = fit_performance(_measure(TRUTH, start, 5, shapes=dense_only), start, make_rng(4, "f"))
+    assert "sparse_speedup_at_50" in f.fixed and f.params["sparse_speedup_at_50"] == start.compute.sparse_speedup_at_50
+    assert any("kept at its placeholder" in w for w in f.warnings)
+    c = analyst_start_config(TRUTH); apply_perf_fit(c, f, "bench")
+    assert c.compute.sparse_speedup_at_50 == 1.85 and "compute.sparse_speedup_at_50" in placeholder_audit(c).unresolved
+    assert "memory.hbm_efficiency" in placeholder_audit(c).resolved
+
+
+def test_zero_sensitivity_parameter_is_dropped_instead_of_failing():
+    start = analyst_start_config(TRUTH)
+    # sparse shapes that are strongly memory-bound at the fitted bandwidth carry no information about the compute speedup
+    A = start.compute.array_size
+    shapes = [dict(M=1, K=16 * A, N=16 * A, dtype="int8", sparsity=0.5)] * 3 + suggest_gemm_shapes(start)[:10]
+    f = fit_performance(_measure(TRUTH, start, 6, shapes=shapes), start, make_rng(4, "f"))
+    assert f.params["pipeline_overlap"] == pytest.approx(0.6, abs=0.15)                # the others still fit
+    assert "sparse_speedup_at_50" in f.fixed
+
+
+def test_parameters_that_do_not_bind_at_the_optimum_are_dropped_after_the_fit():
+    """Shapes look informative at nominal parameters (pre-filter passes) but are all memory-bound once the true, very low
+    bandwidth efficiency is applied -> overlap/speedup have zero sensitivity there.  The fit must drop them, not crash."""
+    start = analyst_start_config(TRUTH)
+    t = TRUTH.copy(); t.memory.hbm_efficiency = 0.12
+    meas = _measure(t, start, 5)
+    assert regime_counts(meas, start)["sparse_speedup_at_50"] >= 3 and regime_counts(meas, start)["pipeline_overlap"] >= 3
+    f = fit_performance(meas, start, make_rng(4, "f"))
+    assert set(f.fixed) == {"pipeline_overlap", "sparse_speedup_at_50"}
+    assert sum("zero sensitivity at the optimum" in w for w in f.warnings) == 2
+    assert f.params["hbm_efficiency"] == pytest.approx(0.12, rel=0.03) and f.t_launch_s == pytest.approx(8e-6, rel=0.1)
+    c = analyst_start_config(TRUTH); apply_perf_fit(c, f, "bench")
+    assert c.compute.pipeline_overlap == start.compute.pipeline_overlap and c.memory.hbm_efficiency == f.params["hbm_efficiency"]
+    a = placeholder_audit(c)
+    assert "compute.pipeline_overlap" in a.unresolved and "compute.sparse_speedup_at_50" in a.unresolved and "memory.hbm_efficiency" in a.resolved
+
+
+def test_perf_apply_notes_that_ecc_overhead_is_absorbed():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5), start, make_rng(4, "f"))
+    c = analyst_start_config(TRUTH); apply_perf_fit(c, f, "bench")
+    assert c.calibration["memory.ecc_bw_overhead_pct"]["status"] == "absorbed"
+    assert c.memory.hbm_efficiency == f.params["hbm_efficiency"] and any("absorbs the ECC" in w for w in f.warnings)
+
+
+def test_perf_input_checks():
+    start = analyst_start_config(TRUTH)
+    with pytest.raises(CalibrationDataError, match=">= 8"):
+        fit_performance(_measure(TRUTH, start, 5)[:5], start, make_rng(0, "f"))
+
+
+def test_design_coverage_is_chip_specific_and_predicts_identifiability():
+    slow = analyst_start_config(TRUTH)
+    cov = design_coverage(slow)
+    assert all(v >= 3 for v in cov.values())
+    fast = SimConfig()                      # 2 TB/s: GEMMs never bandwidth-limited -> hbm_efficiency unobservable
+    assert design_coverage(fast)["hbm_efficiency"] == 0
+    meas = [PerfMeasurement(s["M"], s["K"], s["N"], s["dtype"], s["sparsity"], 1.5, 1e-3) for s in suggest_gemm_shapes(slow)]
+    assert regime_counts(meas, slow)["pipeline_overlap"] >= 3
+
+
+def test_suggested_designs_have_expected_structure():
+    d = suggest_power_design()
+    assert len(d) == 18 and {x["util"] for x in d} == {0.0, 0.5, 1.0} and len({x["T_k"] for x in d}) == 3
+    shapes = suggest_gemm_shapes(SimConfig())
+    assert any(s["sparsity"] == 0.5 for s in shapes) and any(s["M"] == 1 for s in shapes)
+    A = 256
+    assert min(s["K"] for s in shapes) == A // 4 and any(s["M"] == s["N"] == s["K"] == A // 2 for s in shapes)
+```
+
+### `tests/test_cal_workflow.py`
+
+```python
+import copy
+import dataclasses
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import uchu.calibration.workflow as W
+from uchu import SimConfig, build_transformer_workload, make_rng
+from uchu.calibration import (CalibrationOptions, epistemic_mission_study, load_plan, placeholder_audit, run_calibration)
+from uchu.calibration.data import FlightLog, ThermalSample
+from uchu.calibration.registry import get_by_path
+from uchu.calibration.synthetic import write_campaign
+from uchu.calibration.workflow import _static_rate_per_bit_day, main
+from tests._campaign import START, TRUTH, build
+
+OPTS = CalibrationOptions(seed=7, n_boot=60, n_draws=60)
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="module")
+def full():
+    d = build(11)
+    return d, run_calibration(START, d, OPTS)
+
+
+def near(ci, est, truth, k=3.5):
+    se = (ci[1] - ci[0]) / (2 * 1.96)
+    return abs(est - truth) <= k * se + 1e-12 * max(1.0, abs(truth))
+
+
+# ====================================================================== end to end vs hidden truth
+def test_every_step_succeeds_and_the_input_config_is_untouched(full):
+    d, rep = full
+    assert all(s.status == "ok" for s in rep.steps), [(s.name, s.error) for s in rep.steps if s.status != "ok"]
+    assert START.calibration == {} and START.radiation.sram.ion.sigma_sat_cm2 == 1e-14      # caller's config not mutated
+    assert rep.config.config_hash() != rep.initial_hash and rep.initial_hash == START.config_hash()
+    rep.config.validate()
+    assert SimConfig.from_json(rep.config.to_json()).config_hash() == rep.config.config_hash()
+
+
+def test_calibrated_parameters_recover_the_hidden_truth(full):
+    _, rep = full
+    cal, inside, tot, bad = rep.config.calibration, 0, 0, []
+    for path, e in cal.items():
+        if e["ci95"] is None or path == "radiation.avf_sram":          # avf has no hidden truth: it is a measurement
+            continue
+        tv, lo, hi = get_by_path(TRUTH, path), *e["ci95"]
+        tot += 1; inside += lo <= tv <= hi
+        if not near(e["ci95"], e["value"], tv):
+            bad.append((path, tv, e["value"], e["ci95"]))
+    assert tot >= 28 and inside / tot >= 0.85, (inside, tot)
+    assert not bad, bad
+
+
+def test_predicted_rate_moves_from_a_3x_error_to_within_15_percent(full):
+    _, rep = full
+    truth = _static_rate_per_bit_day(TRUTH, "sram")
+    d = rep.rate_summary["sram"]
+    assert truth / d["placeholder"] > 2.5                                    # the shipped placeholder was badly off
+    assert d["median"] == pytest.approx(truth, rel=0.15)
+    assert d["lo"] <= truth <= d["hi"] and d["posterior"]["lo"] <= truth <= d["posterior"]["hi"]
+    assert (d["posterior"]["hi"] - d["posterior"]["lo"]) < (d["hi"] - d["lo"])      # flight data tighten the interval
+    assert d["unresolved_fraction"] == 0.0
+
+
+def test_intervals_resting_on_placeholders_are_flagged(full):
+    _, rep = full
+    r = rep.rate_summary["register"]
+    assert r["unresolved_kinds"] == ["proton"] and r["unresolved_fraction"] > 0.99
+    assert "⚠ 100% rests on placeholder proton" in rep.to_markdown()
+
+
+def test_audit_lists_exactly_what_the_data_did_not_cover(full):
+    _, rep = full
+    a = rep.audit
+    for p in ("radiation.logic_set.ion.sigma_sat_cm2", "radiation.sel.ion.x_th", "radiation.register.proton.width",
+              "power.interconnect_frac", "power.interconnect_extra_exponent", "radiation.avf_register",
+              "radiation.set_pulse_width_ps", "radiation.reg_bits_per_pe", "radiation.sel_recovery_s"):
+        assert p in a.unresolved, p
+    for p in ("radiation.sram.ion.sigma_sat_cm2", "radiation.environment", "radiation.mbu_prob", "orbital.sep_events_per_year",
+              "power.base_power_w", "thermal.capacitance_j_per_k", "compute.pipeline_overlap", "memory.hbm_efficiency",
+              "radiation.gates_per_pe", "radiation.avf_sram", "memory.ecc_bw_overhead_pct", "thermal.albedo_geometry"):
+        assert p in a.resolved, p
+    assert a.n_total == len(a.resolved) + len(a.accepted) + len(a.unresolved) and len(a.resolved) > 35
+
+
+def test_flight_data_are_consistent_with_the_calibrated_model(full):
+    _, rep = full
+    f = rep.flight[0]
+    assert f.p_consistency > 0.05 and f.ess > 10 and not f.warnings
+    assert abs(f.observed - f.expected_prior_mean) < 4 * f.expected_prior_mean ** 0.5          # within 4 Poisson sigma
+
+
+def test_report_serialises_and_renders(full):
+    _, rep = full
+    js = json.loads(json.dumps(rep.to_dict(), default=str))
+    assert {"steps", "ledger", "audit", "rate_summary", "flight", "provenance"} <= set(js)
+    assert js["audit"]["unresolved"] and js["calibrated_config_hash"] == rep.config.config_hash()
+    md = rep.to_markdown()
+    for h in ("# Calibration report", "## Steps", "## Calibrated parameters", "## Still placeholders", "## Flight-data consistency"):
+        assert h in md
+    assert "`radiation.sram.ion.sigma_sat_cm2`" in md
+
+
+def test_determinism_and_seed_sensitivity():
+    d = build(3, flight=False, hardware=False, avf=False)
+    o = CalibrationOptions(seed=1, n_boot=30, n_draws=20)
+    a, b = run_calibration(START, d, o), run_calibration(START, d, o)
+    assert json.dumps(a.to_dict(), default=str) == json.dumps(b.to_dict(), default=str)
+    c = run_calibration(START, d, dataclasses.replace(o, seed=2))
+    assert c.config.calibration["radiation.sram.ion.x_th"]["ci95"] != a.config.calibration["radiation.sram.ion.x_th"]["ci95"]
+    assert c.config.radiation.sram.ion == a.config.radiation.sram.ion          # point estimates are data-driven (seed only affects intervals)
+
+
+# ====================================================================== failure isolation
+def test_bad_data_in_one_step_fails_only_that_step_and_leaves_placeholders_alone():
+    d = build(5, flight=False, avf=False)
+    d.thermal = d.thermal[:6]                                               # far too short
+    rep = run_calibration(START, d, dataclasses.replace(OPTS, n_boot=30, n_draws=10))
+    st = {s.name: s for s in rep.steps}
+    assert st["thermal model"].status == "failed" and "thermal telemetry samples" in st["thermal model"].error
+    assert all(s.status in ("ok", "skipped") for n, s in st.items() if n != "thermal model")
+    assert {n for n, s in st.items() if s.status == "skipped"} == {"flight-data update"}
+    assert rep.config.thermal.capacitance_j_per_k == START.thermal.capacitance_j_per_k          # untouched
+    assert "thermal.capacitance_j_per_k" in rep.audit.unresolved and "power.base_power_w" in rep.audit.resolved
+
+
+def test_internal_bugs_are_not_disguised_as_data_problems(monkeypatch):
+    d = build(5, flight=False, avf=False, mbu=False, sep=False, register=False)
+    monkeypatch.setattr(W, "fit_power_model", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rep = run_calibration(START, d, dataclasses.replace(OPTS, n_boot=20, n_draws=5))
+    s = next(s for s in rep.steps if s.name == "power model")
+    assert s.status == "failed" and s.error.startswith("INTERNAL RuntimeError: boom")
+
+
+def test_skipped_steps_when_no_data_and_empty_run_is_harmless():
+    rep = run_calibration(START, W.CalibrationData(), OPTS)
+    assert rep.steps and all(s.status == "skipped" for s in rep.steps)
+    assert rep.config.config_hash() == START.config_hash() and rep.draws == [] and rep.rate_summary == {}
+    assert len(rep.audit.unresolved) == rep.audit.n_total
+
+
+# ====================================================================== flight data & epistemic propagation
+def _small(seed, events_scale=1.0):
+    d = build(seed, hardware=False, mbu=False, sep=False, register=False, avf=False)
+    f = d.flight[0]
+    d.flight = [FlightLog(f.name, f.region, f.n_units, f.segments, int(round(f.events * events_scale)), f.flare_events)]
+    return d
+
+
+def test_flight_counts_move_the_posterior_in_the_right_direction():
+    o = dataclasses.replace(OPTS, n_boot=40, n_draws=120)
+    lo = run_calibration(START, _small(21, 0.6), o).rate_summary["sram"]["posterior"]["median"]
+    mid = run_calibration(START, _small(21, 1.0), o).rate_summary["sram"]["posterior"]["median"]
+    hi = run_calibration(START, _small(21, 1.5), o).rate_summary["sram"]["posterior"]["median"]
+    assert lo < mid < hi
+
+
+def test_inconsistent_flight_data_raise_a_loud_flag_unless_discrepancy_is_allowed():
+    d = _small(21, 8.0)
+    o = dataclasses.replace(OPTS, n_boot=40, n_draws=100)
+    rep = run_calibration(START, d, o)
+    assert rep.flight[0].p_consistency < 0.01 and any("inconsistent" in w for s in rep.steps for w in s.warnings)
+    soft = run_calibration(START, d, dataclasses.replace(o, flight_discrepancy_log_sigma=2.0))
+    assert soft.flight[0].p_consistency > rep.flight[0].p_consistency
+
+
+def test_sample_configs_are_valid_reproducible_and_span_the_uncertainty(full):
+    _, rep = full
+    cfgs = rep.sample_configs(40, make_rng(1, "s"))
+    assert len(cfgs) == 40 and all(c.validate() for c in cfgs)
+    again = rep.sample_configs(40, make_rng(1, "s"))
+    assert [c.config_hash() for c in cfgs] == [c.config_hash() for c in again]
+    sig = np.array([c.radiation.sram.ion.sigma_sat_cm2 for c in cfgs])
+    lo, hi = rep.config.calibration["radiation.sram.ion.sigma_sat_cm2"]["ci95"]
+    assert sig.std() > 0 and lo * 0.5 < np.median(sig) < hi * 1.5
+    assert len({c.power.base_power_w for c in cfgs}) > 10 and len({c.thermal.capacitance_j_per_k for c in cfgs}) > 10
+    assert rep.config_for_draw(0).radiation.sram.ion is not rep.config.radiation.sram.ion          # no aliasing
+
+
+def test_epistemic_study_pushes_calibration_uncertainty_through_the_simulator(full):
+    _, rep = full
+    layers = build_transformer_workload(num_layers=2)
+    out = epistemic_mission_study(rep, layers, mission_s=900.0, n=8, dt_max_s=30.0, seed=3)
+    assert set(out) == {"T_max_k", "avg_tflops", "avg_power_w", "sdc_per_hr", "seu_sram"} and all(len(v) == 8 for v in out.values())
+    assert np.all(np.isfinite(out["T_max_k"])) and np.all(out["avg_power_w"] > 5)
+    assert out["avg_power_w"].std() > 0 and out["avg_power_w"].std() / out["avg_power_w"].mean() < 0.1
+    again = epistemic_mission_study(rep, layers, mission_s=900.0, n=8, dt_max_s=30.0, seed=3)
+    assert np.array_equal(out["avg_power_w"], again["avg_power_w"])
+
+
+def test_calibrated_config_behaves_like_the_truth_in_the_simulator(full):
+    from uchu import run_mission
+    _, rep = full
+    layers = build_transformer_workload(num_layers=4)
+    t = run_mission(TRUTH, layers, 3000.0, dt_max_s=30.0, seed=1)
+    c = run_mission(rep.config, layers, 3000.0, dt_max_s=30.0, seed=1)
+    p = run_mission(START, layers, 3000.0, dt_max_s=30.0, seed=1)
+    # measured: calibrated within <1 % of truth on power/throughput and <1 K on temperature; placeholders are 16-26 % / 21 K off
+    assert c.avg_power_w == pytest.approx(t.avg_power_w, rel=0.02) and abs(p.avg_power_w - t.avg_power_w) > 0.15 * t.avg_power_w
+    assert c.avg_tflops_dense == pytest.approx(t.avg_tflops_dense, rel=0.02) and abs(p.avg_tflops_dense - t.avg_tflops_dense) > 0.08 * t.avg_tflops_dense
+    assert abs(c.T_mean_k - t.T_mean_k) < 1.0 and abs(p.T_mean_k - t.T_mean_k) > 10.0
+
+
+# ====================================================================== CLI / files
+def test_cli_end_to_end_from_csv_files(tmp_path):
+    plan = write_campaign(tmp_path / "camp", TRUTH, START, make_rng(31, "cli"))
+    out = tmp_path / "out"
+    assert main([str(plan), "--out", str(out)]) == 0
+    for f in ("calibrated_config.json", "calibration_report.json", "calibration_report.md"):
+        assert (out / f).stat().st_size > 500
+    cfg = SimConfig.from_json((out / "calibrated_config.json").read_text()).validate()
+    assert cfg.calibration["radiation.sram.ion.sigma_sat_cm2"]["status"] == "measured"
+    assert cfg.radiation.environment_mode == "tabulated_orbit" and cfg.radiation.gates_per_pe == 1800
+    rep = json.loads((out / "calibration_report.json").read_text())
+    assert all(s["status"] == "ok" for s in rep["steps"]) and rep["audit"]["unresolved"]
+    assert "# Calibration report" in (out / "calibration_report.md").read_text()
+
+
+def test_cli_plan_errors_and_failed_steps_have_distinct_exit_codes(tmp_path):
+    plan = write_campaign(tmp_path / "camp", TRUTH, START, make_rng(32, "cli"))
+    p = json.loads(plan.read_text())
+    bad = tmp_path / "camp" / "bad_plan.json"
+    q = copy.deepcopy(p); q["beam"][0]["file"] = "does_not_exist.csv"; bad.write_text(json.dumps(q))
+    assert main([str(bad), "--out", str(tmp_path / "o1")]) == 3
+    q = copy.deepcopy(p); (tmp_path / "camp" / "mbu.csv").write_text("cluster_size,count\n1,x\n"); bad.write_text(json.dumps(q))
+    assert main([str(bad), "--out", str(tmp_path / "o2")]) == 3                       # malformed CSV: rejected up front
+    assert main([str(tmp_path / "nonexistent.json")]) == 3
+    # a *scientifically* unusable dataset (loads fine, cannot be fitted) -> workflow completes, exit 2, step marked failed
+    short = tmp_path / "camp" / "thermal.csv"
+    short.write_text("t_s,power_w,eclipse,T_k\n" + "\n".join(f"{i * 30},40,0,{290 + 0.01 * i}" for i in range(12)) + "\n")
+    (tmp_path / "camp" / "mbu.csv").write_text("cluster_size,count\n1,500\n2,100\n3,40\n")
+    q = copy.deepcopy(p); q["options"]["n_boot"] = 20; q["options"]["n_draws"] = 10; bad.write_text(json.dumps(q))
+    assert main([str(bad), "--out", str(tmp_path / "o3")]) == 2
+    rep = json.loads((tmp_path / "o3" / "calibration_report.json").read_text())
+    assert [s["name"] for s in rep["steps"] if s["status"] == "failed"] == ["thermal model"]
+
+
+def test_module_entry_point_runs():
+    r = subprocess.run([sys.executable, "-m", "uchu.calibration", "--help"], cwd=ROOT, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "calibration plan" in r.stdout
+
+
+def test_load_plan_resolves_relative_paths_and_options(tmp_path):
+    plan = write_campaign(tmp_path / "c", TRUTH, START, make_rng(33, "cli"))
+    cfg, data, opts = load_plan(plan)
+    assert opts.n_boot == 80 and opts.seed == 7 and cfg.config_hash() == START.config_hash()
+    assert len(data.beam) == 3 and data.mbu and data.sep and data.power and data.thermal and data.perf and data.flight
+    assert set(data.env_tables) == set(TRUTH.radiation.tables) and data.design_facts[0].path == "radiation.gates_per_pe"
+
+
+# ====================================================================== whole-pipeline statistical validation
+@pytest.mark.slow
+def test_whole_workflow_interval_coverage_over_independent_campaigns():
+    R, inside, total, rate_hits = 10, 0, 0, 0
+    tr = _static_rate_per_bit_day(TRUTH, "sram")
+    o = CalibrationOptions(seed=1, n_boot=60, n_draws=60)
+    for i in range(R):
+        rep = run_calibration(START, build(1000 + i, flight=False, avf=False), o)
+        assert not any(s.status == "failed" for s in rep.steps), [(s.name, s.error) for s in rep.steps if s.status == "failed"]
+        for path, e in rep.config.calibration.items():
+            if e["ci95"] is None:
+                continue
+            total += 1; inside += e["ci95"][0] <= get_by_path(TRUTH, path) <= e["ci95"][1]
+        r = rep.rate_summary["sram"]; rate_hits += r["lo"] <= tr <= r["hi"]
+    # measured: see docs.  Percentile-bootstrap + Wald intervals at these sample sizes are close to, but not exactly, nominal.
+    assert inside / total >= 0.85, (inside, total)
+    assert rate_hits / R >= 0.7
+```
+
+---
+
+## 10. Tools and project files
+
+### `tools/mutation_check.py`
+
+```python
+"""Mutation check: re-introduce a defect into a scratch copy of the package and confirm the relevant tests FAIL.
+A surviving mutant means the suite would not have caught that bug.  Slow (statistical) tests are excluded; each mutant
+runs only the test files that are supposed to guard that code.
+
+    python tools/mutation_check.py [substring-filter]
+"""
+import pathlib, shutil, subprocess, sys, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MEM, THM, ORB, RAD = "tests/test_memory.py", "tests/test_thermal.py", "tests/test_orbit.py", "tests/test_radiation.py"
+CD, CR, CH, CW = "tests/test_cal_data.py", "tests/test_cal_radiation.py", "tests/test_cal_hardware.py", "tests/test_cal_workflow.py"
+
+MUTANTS = [
+    # ---- v3 core (original v2 defects) -------------------------------------------------------------
+    ("sparsity double-counted (v2 bug)", "uchu/memory.py", "    executed = 2.0 * M * N * K_eff\n",
+     "    executed = 2.0 * M * N * K_eff / spd\n    t_compute = t_compute / spd\n", [MEM]),
+    ("dtype throughput inverted (v2 bug)", "uchu/config.py", 'INT8 = ("int8", 1.0, 1.0)', 'INT8 = ("int8", 1.0, 0.25)', [MEM, "tests/test_rng_config.py"]),
+    ("thermal state clobbered by static estimate (v2 bug)", "uchu/thermal.py",
+     "        self.T = a if a == b else brentq(g, min(a, b), max(a, b), xtol=1e-10, rtol=1e-13, maxiter=200)\n        return self.T",
+     "        self.T = a if a == b else brentq(g, min(a, b), max(a, b), xtol=1e-10, rtol=1e-13, maxiter=200)\n        self.T = 250.0 + 0.8 * power_fn(self.T)\n        return self.T", [THM]),
+    ("GCR rises with solar activity (v2 bug)", "uchu/radiation.py",
+     "{SolarActivity.LOW: 1.0, SolarActivity.MODERATE: 0.7, SolarActivity.HIGH: 0.45}",
+     "{SolarActivity.LOW: 0.45, SolarActivity.MODERATE: 0.7, SolarActivity.HIGH: 1.0}", [RAD]),
+    ("flare intensity ignored (v2 bug)", "uchu/orbit.py", "        return float(np.sum(i * overlap))", "        return float(np.sum(overlap))", [ORB]),
+    ("no bit interleaving in ECC words", "uchu/radiation.py", "        return row * self.I + (col % self.I)", "        return bits // self.W", [RAD]),
+    ("scrub declares everything corrected (v2 bug)", "uchu/radiation.py", "        corrected = int(np.sum(counts == 1))", "        corrected = int(counts.size)", [RAD]),
+    ("XOR toggle replaced by OR", "uchu/radiation.py", "        self.state = u[(c % 2) == 1]", "        self.state = u", [RAD]),
+    ("eclipse boundary dropped", "uchu/orbit.py", "            segs.append((t, b, True))", "            segs.append((t, b, False))", [ORB]),
+    ("MBU probability ignored", "uchu/radiation.py", "            is_mbu = rng.random(n) < rc.mbu_prob", "            is_mbu = rng.random(n) < 0.0", [RAD]),
+    ("SET capture ignores clock frequency", "uchu/radiation.py",
+     "p_cap = min(1.0, rc.set_pulse_width_ps * 1e-12 * freq_ghz * 1e9)", "p_cap = min(1.0, rc.set_pulse_width_ps * 1e-12 * 1.5e9)", [RAD]),
+    ("forward Euler instead of implicit", "uchu/thermal.py",
+     "        C, T0, Q = self.tc.capacitance_j_per_k, self.T, self.env_load_w(eclipse)",
+     "        C, T0, Q = self.tc.capacitance_j_per_k, self.T, self.env_load_w(eclipse)\n        self.T = T0 + dt * (power_fn(T0) + Q - self.radiated_w(T0)) / C\n        return self.T", [THM]),
+    ("TMR has no effect", "uchu/radiation.py", "        self._tmr = rc.tmr_residual if rc.tmr_enabled else 1.0", "        self._tmr = 1.0", [RAD]),
+    ("roofline uses only compute time", "uchu/memory.py", "    duration = max(t_compute, t_mem)", "    duration = t_compute", [MEM]),
+    ("leakage factor applied to dynamic power (v2 bug)", "uchu/thermal.py",
+     "        self.dynamic_nom_w = pw.base_power_w * (1.0 - pw.static_frac) * self.array_ratio * cap_rel",
+     "        self.dynamic_nom_w = pw.base_power_w * (1.0 - pw.static_frac) * self.array_ratio * cap_rel * leak_rel", [THM]),
+    # ---- calibration: config / environment hooks -------------------------------------------------------
+    ("tabulated mode still applies placeholder scalings", "uchu/radiation.py", "        if tabulated:        # orbit-specific, already-shielded tables: no placeholder scalings",
+     "        if False:", [CD]),
+    ("hbm_efficiency ignored", "uchu/memory.py", " * eff * m.hbm_efficiency", " * eff", [CD, MEM]),
+    ("MBU geometric parameter hard-coded", "uchu/radiation.py", "self.rng.geometric(self.rc.mbu_cluster_geom_p, size=n)", "self.rng.geometric(0.5, size=n)", [CD]),
+    ("SEP intensity median ignored", "uchu/orbit.py", "self.rng.lognormal(math.log(self.median), self.log_sigma)", "self.rng.lognormal(0.0, self.log_sigma)", [CD]),
+    ("config round-trip drops enums", "uchu/config.py", "        return tp[val.split(\".\")[-1]] if isinstance(val, str) else tp(val)", "        return list(tp)[0]", [CD]),
+    # ---- calibration: data layer & registry ----------------------------------------------------------------
+    ("effective LET multiplies by cos instead of dividing", "uchu/calibration/data.py", "    return let_normal / math.cos(math.radians(tilt_deg))", "    return let_normal * math.cos(math.radians(tilt_deg))", [CD]),
+    ("tilt not applied to fluence", "uchu/calibration/data.py", "            fl = fl * math.cos(math.radians(tilt))", "            fl = fl", [CD]),
+    ("accepted placeholders recorded as measured", "uchu/calibration/registry.py", "    record(cfg, path, source=\"analyst\", method=\"accepted\", status=STATUS_ACCEPTED, note=reason)",
+     "    record(cfg, path, source=\"analyst\", method=\"accepted\", status=\"measured\", note=reason)", [CD]),
+    ("audit counts accepted as resolved", "uchu/calibration/registry.py", "        elif e[\"status\"] == STATUS_ACCEPTED:\n            res.accepted[p] = e", "        elif e[\"status\"] == STATUS_ACCEPTED:\n            res.resolved[p] = e", [CD]),
+    # ---- calibration: radiation fits -------------------------------------------------------------------------
+    ("Poisson NLL sign error", "uchu/calibration/fit_radiation.py", "    return float(np.sum(mu - k * np.log(mu)))", "    return float(np.sum(mu + k * np.log(mu)))", [CR]),
+    ("deviance missing factor 2", "uchu/calibration/fit_radiation.py", "    return float(2.0 * np.sum(t - (k - mu)))", "    return float(np.sum(t - (k - mu)))", [CR]),
+    ("bootstrap does not resample", "uchu/calibration/fit_radiation.py", "th1, d1 = bootstrap(lambda: rng.poisson(mu_hat).astype(float))", "th1, d1 = bootstrap(lambda: np.round(mu_hat))", [CR]),
+    ("over-dispersed intervals not widened", "uchu/calibration/fit_radiation.py", "        samples = th2", "        samples = th1", [CR]),
+    ("saturation warning never fires", "uchu/calibration/fit_radiation.py", "    if frac_sat < 0.9:", "    if False:", [CR]),
+    ("MBU geometric MLE inverted", "uchu/calibration/fit_radiation.py", "    q = n_stop / (n_stop + n_cont) if (n_stop + n_cont) > 0 else 1.0", "    q = n_cont / (n_stop + n_cont) if (n_stop + n_cont) > 0 else 1.0", [CR]),
+    ("SEP rate not converted to per-year", "uchu/calibration/fit_radiation.py", "    rate = n / cat.obs_span_s * yr", "    rate = n / cat.obs_span_s", [CR]),
+    ("flight likelihood inverted", "uchu/calibration/fit_radiation.py", "        like = stats.poisson.pmf(k_obs, E)\n", "        like = 1.0 - stats.poisson.pmf(k_obs, E)\n", [CR]),
+    ("Gamma posterior ignores Jeffreys half-count", "uchu/calibration/fit_radiation.py", "    d = stats.gamma(k_obs + 0.5, scale=1.0 / E_expected)", "    d = stats.gamma(k_obs, scale=1.0 / E_expected)", [CR]),
+    ("weighted quantile ignores weights", "uchu/calibration/fit_radiation.py", "    cw = np.cumsum(w) - 0.5 * w", "    cw = np.arange(len(w)) + 0.5", [CR]),
+    ("table coverage check disabled", "uchu/calibration/fit_radiation.py", "            if xs.sigma_sat_cm2 > 0 and tab.x[0] > xs.x_th:", "            if False:", [CR]),
+    # ---- calibration: hardware fits -----------------------------------------------------------------------------
+    ("power inversion swaps static and dynamic", "uchu/calibration/fit_hardware.py", "    return stat + dyn, stat / (stat + dyn)", "    return stat + dyn, dyn / (stat + dyn)", [CH]),
+    ("identifiability check disabled", "uchu/calibration/fit_hardware.py", "    if cond > COND_FATAL:", "    if False:", [CH]),
+    ("thermal integrator uses the wrong interval's eclipse flag", "uchu/calibration/fit_hardware.py", "        rhs = P[i] + (Q_ecl if ecl[i] else Q_sun)", "        rhs = P[i] + (Q_ecl if ecl[i - 1] else Q_sun)", [CH]),
+    ("radiator area ignores view factor", "uchu/calibration/fit_hardware.py", "    A = kr / (SIGMA_SB * tc.emissivity * F_eff)", "    A = kr / (SIGMA_SB * tc.emissivity)", [CH]),
+    ("zero-sensitivity parameters never dropped", "uchu/calibration/fit_hardware.py", "        weak = [free[j] for j in range(len(free)) if cn[j] < 1e-6 * max(cn.max(), 1e-300)]", "        weak = []", [CH]),
+    ("launch-overhead bound too tight (bug found during development)", "uchu/calibration/fit_hardware.py", "hi = np.array([1.0, 1.0, 2.0, 0.999 * lat.min()])", "hi = np.array([1.0, 1.0, 2.0, 0.9 * lat.min()])", [CH]),
+    ("sparse parameter always considered informative", "uchu/calibration/fit_hardware.py", "        if m.sparsity == 0.5 and a.t_memory_s < 0.5 * a.t_compute_s:", "        if m.sparsity == 0.5:", [CH]),
+    # ---- calibration: workflow -------------------------------------------------------------------------------------
+    ("placeholder-dependence flag always zero", "uchu/calibration/workflow.py", "    frac = sum(part[k] for k in unresolved) / total if total > 0 else 0.0", "    frac = 0.0", [CW]),
+    ("flight weights not applied to draws", "uchu/calibration/workflow.py", "        weights = wts / wts.sum()", "        weights = np.ones(len(draws)) / len(draws)", [CW]),
+    ("step failures abort silently as ok", "uchu/calibration/workflow.py", "            steps.append(StepResult(name, \"failed\", error=str(e)))", "            steps.append(StepResult(name, \"ok\", {}))", [CW]),
+    ("input config mutated in place", "uchu/calibration/workflow.py", "    cfg = cfg.copy().validate()\n    steps", "    cfg = cfg.validate()\n    steps", [CW]),
+]
+
+
+def run_one(name, rel, old, new, tests):
+    with tempfile.TemporaryDirectory() as td:
+        dst = pathlib.Path(td) / "w"
+        shutil.copytree(ROOT, dst, ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", ".coverage", "tools", "*.pyc"))
+        f = dst / rel
+        src = f.read_text()
+        if old not in src:
+            return "SETUP-ERROR", f"pattern not found in {rel}"
+        f.write_text(src.replace(old, new, 1))
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", "-m", "not slow", *tests],
+                           cwd=dst, capture_output=True, text=True)
+        first = next((l for l in r.stdout.splitlines() if l.startswith("FAILED") or l.startswith("ERROR")), "")
+        return ("KILLED" if r.returncode != 0 else "SURVIVED"), first
+
+
+def main() -> int:
+    flt = sys.argv[1] if len(sys.argv) > 1 else ""
+    bad = []
+    sel = [m for m in MUTANTS if flt in m[0]]
+    for name, rel, old, new, tests in sel:
+        status, first = run_one(name, rel, old, new, tests)
+        print(f"[{status:8s}] {name}   {first.split(' - ')[0][-70:]}", flush=True)
+        if status != "KILLED":
+            bad.append(name)
+    print(f"\n{len(sel) - len(bad)}/{len(sel)} mutants killed")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### `tools/demo.py`
+
+```python
+"""Demo: 3 LEO orbits of a 12-layer INT8 transformer; prints a compact, reproducible summary."""
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from uchu import SimConfig, build_transformer_workload, run_mission, run_workload
+
+cfg = SimConfig(random_seed=42)
+cfg.thermal.capacitance_j_per_k = 200.0
+layers = build_transformer_workload(num_layers=12)
+
+w = run_workload(cfg, layers, n_passes=100)
+print(f"[workload] {w.n_passes} passes, {w.elapsed_s*1e3:.2f} ms simulated")
+print(f"  dense-equivalent throughput : {w.avg_tflops_dense:7.2f} TFLOPS   power {w.avg_power_w:6.2f} W   "
+      f"({w.tflops_per_watt:.2f} TFLOPS/W)   memory-bound time {w.memory_bound_fraction:.1%}")
+
+m = run_mission(cfg, layers, mission_s=3 * 5739.0, duty=0.8, dt_max_s=10.0)
+r = m.radiation
+print(f"[mission ] {m.simulated_s/3600:.2f} h simulated, completed={m.completed}, failed={m.failed}")
+print(f"  temperature  min/mean/max   : {m.T_min_k:6.1f} / {m.T_mean_k:6.1f} / {m.T_max_k:6.1f} K   throttled {m.throttled_fraction:.1%}")
+print(f"  power / throughput           : {m.avg_power_w:6.2f} W / {m.avg_tflops_dense:6.2f} TFLOPS (duty 0.8)")
+print(f"  SRAM SEUs / MBU / corrected  : {r.n_seu_sram} / {r.n_mbu} / {r.words_corrected}   DUE {r.words_due}   SDC {r.sdc_total}")
+lo, hi = r.sdc_per_hr_ci()
+print(f"  SDC rate 95% CI (per hour)   : [{lo:.3g}, {hi:.3g}]   availability {r.availability:.4f}")
+print(f"  provenance                   : {m.provenance['model_version']} cfg={m.provenance['config_hash']} seed={m.provenance['seed']}")
+```
+
+### `tools/calibration_demo.py`
+
+```python
+"""End-to-end calibration demo on a SYNTHETIC campaign (hidden truth -> CSV files -> plan.json -> CLI -> report).
+
+    python tools/calibration_demo.py [work_dir]
+
+Shows the exact file formats and the exact command a real campaign would use.  Synthetic data prove the machinery
+recovers known parameters; they do not prove the models describe real hardware.
+"""
+import json, pathlib, sys, tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+from uchu import SimConfig, make_rng
+from uchu.calibration.registry import get_by_path
+from uchu.calibration.synthetic import analyst_start_config, make_truth_config, write_campaign
+from uchu.calibration.workflow import _static_rate_per_bit_day, main
+
+work = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="uchu_cal_"))
+truth = make_truth_config()
+plan = write_campaign(work / "campaign", truth, analyst_start_config(truth), make_rng(2024, "demo"))
+print(f"campaign files: {sorted(p.name for p in plan.parent.iterdir())}\n")
+code = main([str(plan), "--out", str(work / "out")])
+
+cfg = SimConfig.from_json((work / "out" / "calibrated_config.json").read_text())
+rows = [(p, get_by_path(truth, p), e) for p, e in sorted(cfg.calibration.items()) if e["ci95"] and p != "radiation.avf_sram"]
+inside = sum(e["ci95"][0] <= tv <= e["ci95"][1] for _, tv, e in rows)
+print(f"\nhidden truth inside the 95 % interval: {inside}/{len(rows)} parameters")
+tr = _static_rate_per_bit_day(truth, "sram")
+rs = json.loads((work / "out" / "calibration_report.json").read_text())["rate_summary"]["sram"]
+print(f"SRAM upset rate / bit / day: truth {tr:.3e} | shipped placeholder {rs['placeholder']:.3e} | "
+      f"calibrated {rs['median']:.3e} [{rs['lo']:.3e}, {rs['hi']:.3e}]")
+print(f"outputs in {work / 'out'}")
+sys.exit(code)
+```
+### `pyproject.toml`
+
+```toml
+[project]
+name = "uchu"
+version = "3.0.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.11"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["slow: statistical / long-running tests"]
+```
+
+### `requirements.txt`
+
+```text
+numpy>=1.24
+scipy>=1.11
+pytest>=7.4
+```
