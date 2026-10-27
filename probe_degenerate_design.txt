@@ -1,0 +1,51 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+import sys,math; sys.path.insert(0,'.')
+import numpy as np
+from uchu import *
+from uchu.calibration.data import *
+from uchu.calibration.fit_hardware import *
+from uchu.calibration.synthetic import *
+from uchu.config import OrbitalConfig, OrbitType, ProcessNode
+truth=make_truth_config(); rng=make_rng(1,"p")
+# --- power: no T variation / no util variation / no f,v variation
+meas=gen_power(truth,rng)
+def tryfit(label,m,cfg=SimConfig()):
+    try:
+        f=fit_power_model(m,cfg,make_rng(2,"p")); print(f"{label:28s} OK cond {f.cond:.1e} warn {[w[:50] for w in f.warnings][:2]}")
+    except CalibrationDataError as e: print(f"{label:28s} RAISED {str(e)[:110]}")
+tryfit("full design",meas)
+tryfit("only T=300",[m for m in meas if m.T_k==300.0])
+tryfit("only util=1",[m for m in meas if m.util==1.0])
+tryfit("only nominal f,v",[m for m in meas if m.f_ghz==1.5])
+tryfit("7 points",meas[:7])
+# --- power on a NON-reference chip
+t2=SimConfig(); t2.compute.array_size=128; t2.compute.area_mm2=250.0; t2.compute.process_node=ProcessNode.N5; t2.dvfs.nom_voltage_v=0.85; t2.power.base_power_w=48.0; t2.power.static_frac=0.33
+from uchu.thermal import PowerModel as PM
+pm=PM(t2); print("non-ref S,D:",pm.static_nom_w,pm.dynamic_nom_w)
+m2=[PowerMeasurement(d["T_k"],1.5*d["f_frac"],0.85*d["v_frac"],d["util"],pm.power_w(d["T_k"],1.5*d["f_frac"],0.85*d["v_frac"],d["util"])) for d in suggest_power_design()]
+st=SimConfig(); st.compute.array_size=128; st.compute.area_mm2=250.0; st.compute.process_node=ProcessNode.N5; st.dvfs.nom_voltage_v=0.85
+f=fit_power_model(m2,st,make_rng(2,"p")); print("non-ref fit:",{k:round(v,4) for k,v in f.config_values.items()}, "S,D fit",round(f.S_w,4),round(f.D_w,4))
+# --- thermal degenerate designs
+tel=gen_thermal(truth,rng)
+def tfit(label,rows,cfg=SimConfig()):
+    try:
+        f=fit_thermal_model(rows,cfg,make_rng(3,"t")); print(f"{label:28s} OK cond {f.cond:.1e} fixed {f.fixed} warn {[w[:60] for w in f.warnings][:2]}")
+        return f
+    except CalibrationDataError as e: print(f"{label:28s} RAISED {str(e)[:120]}")
+tfit("full",tel)
+sun=[tel[0]]+[r for r in tel[1:] if not r.eclipse]
+# make sunlit-only continuous: take first sunlit stretch
+first=[tel[0]]; 
+for r in tel[1:]:
+    if r.eclipse: break
+    first.append(r)
+tfit("sunlit-only, first stretch",first)
+tfit("constant power",[ThermalSample(r.t_s,40.0,r.eclipse,r.T_k) for r in tel])
+# DEEP orbit thermal mapping
+d=SimConfig(); d.orbital=OrbitalConfig.for_orbit(OrbitType.DEEP)
+print("deep mapping:",thermal_to_config_values(d,300.0,2e-9,15.0,0.0))
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"full design                  OK cond 1.2e+02 warn ['interconnect_frac is not identifiable from chip-le']\nonly T=300                   RAISED need >= 8 power measurements, got 6\nonly util=1                  RAISED need >= 8 power measurements, got 6\nonly nominal f,v             OK cond 3.2e+02 warn ['interconnect_frac is not identifiable from chip-le']\n7 points                     RAISED need >= 8 power measurements, got 7\nnon-ref S,D: 13.2 6.833999999999999\nnon-ref fit: {'base_power_w': 48.0, 'static_frac': 0.33, 'leak_temp_coeff': 3.5, 'clock_frac': 0.08} S,D fit 13.2 6.834\nfull                         OK cond 6.7e+01 fixed [] warn []\nsunlit-only, first stretch   RAISED need >= 20 thermal telemetry samples, got 1\nconstant power               RAISED measurement design cannot identify the parameters (condition number 3.9e+07; weakest direction is dominated by 'C'): add\ndeep mapping: ({'capacitance_j_per_k': 300.0, 'radiator_area_m2': 0.048818047723444315, 'sun_projected_fraction': 1.50508652377939}, [])\n","stderr":""}
