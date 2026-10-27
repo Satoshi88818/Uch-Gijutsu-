@@ -1,0 +1,47 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/calibration/workflow.py'; s=open(p).read()
+s=s.replace('''            rate_summary[region] = d
+''','''            d.update(_placeholder_dependence(report_cfg, region))
+            rate_summary[region] = d
+''')
+s=s.replace('''def _apply(cfg: SimConfig, assign''','''def _placeholder_dependence(cfg: SimConfig, region: str) -> dict:
+    """What share of this region's orbit-static rate is carried by cross-section families that are STILL placeholders?
+    The reported interval does not include their uncertainty, so a high share means the interval is not trustworthy."""
+    orbit = OrbitalEnvironment(cfg.orbital)
+    orbit.flares = FlareSchedule.from_events([])
+    env = RadiationEnvironment(cfg, orbit)
+    sc, comp = env.scalars, env.base[region]
+    part = {"ion": comp["gcr"] * sc["geo"] * sc["solar_gcr"], "proton": comp["trapped"] * sc["trapped"] * sc["proton_shield"]}
+    unresolved = [k for k in ("ion", "proton")
+                  if getattr(getattr(cfg.radiation, region), k).sigma_sat_cm2 > 0 and
+                  any(f"radiation.{region}.{k}.{p}" not in cfg.calibration for p in ("sigma_sat_cm2", "x_th", "width", "shape"))]
+    total = sum(part.values())
+    frac = sum(part[k] for k in unresolved) / total if total > 0 else 0.0
+    return {"unresolved_kinds": unresolved, "unresolved_fraction": float(frac)}
+
+
+def _apply(cfg: SimConfig, assign''')
+s=s.replace('''                L.append(f"| {r} | {d['placeholder']:.3g} | {d['median']:.3g} [{d['lo']:.3g}, {d['hi']:.3g}] | "
+                         + (f"{post['median']:.3g} [{post['lo']:.3g}, {post['hi']:.3g}]" if post else "n/a") + " |")''','''                flag = (f" ⚠ {d['unresolved_fraction']:.0%} rests on placeholder {'/'.join(d['unresolved_kinds'])} cross-section"
+                        if d.get("unresolved_fraction", 0) > 0.05 else "")
+                L.append(f"| {r}{flag} | {d['placeholder']:.3g} | {d['median']:.3g} [{d['lo']:.3g}, {d['hi']:.3g}] | "
+                         + (f"{post['median']:.3g} [{post['lo']:.3g}, {post['hi']:.3g}]" if post else "n/a") + " |")''')
+open(p,'w').write(s)
+# make truth differ more from defaults in RATE terms
+p='uchu/calibration/synthetic.py'; s=open(p).read()
+s=s.replace("r.sram.proton = CrossSection(5.0e-15, 18.0, 40.0, 1.4)","r.sram.proton = CrossSection(1.5e-14, 20.0, 35.0, 1.5)       # ~3x the placeholder proton sensitivity")
+open(p,'w').write(s)
+EOF
+python3 - <<'EOF'
+exec(open('/tmp/e2e_common.py').read())
+from uchu.calibration.workflow import _static_rate_per_bit_day
+truth=make_truth_config(); start=analyst_start_config(truth)
+rep=run_calibration(start,build(11,truth,start),CalibrationOptions(seed=7,n_boot=80,n_draws=80))
+for r in ("sram","register"):
+    d=rep.rate_summary[r]; print(r,"truth %.3e | placeholder %.3e | calibrated %.3e [%.3e,%.3e] | post %s | unresolved %.0f%% %s"%(_static_rate_per_bit_day(truth,r),d["placeholder"],d["median"],d["lo"],d["hi"],{k:float('%.3e'%v) for k,v in (d.get('posterior') or {}).items()},100*d["unresolved_fraction"],d["unresolved_kinds"]))
+print([l for l in rep.to_markdown().splitlines() if "register" in l and "⚠" in l])
+EOF
+
+Response:
+
+{"returncode":0,"stdout":"sram truth 8.534e-10 | placeholder 2.685e-10 | calibrated 8.323e-10 [7.630e-10,9.202e-10] | post {'median': 8.282e-10, 'lo': 7.805e-10, 'hi': 8.953e-10} | unresolved 0% []\nregister truth 2.687e-10 | placeholder 2.685e-10 | calibrated 2.687e-10 [2.687e-10,2.690e-10] | post {'median': 2.687e-10, 'lo': 2.687e-10, 'hi': 2.69e-10} | unresolved 100% ['proton']\n['| register ⚠ 100% rests on placeholder proton cross-section | 2.69e-10 | 2.69e-10 [2.69e-10, 2.69e-10] | 2.69e-10 [2.69e-10, 2.69e-10] |']\n","stderr":""}
