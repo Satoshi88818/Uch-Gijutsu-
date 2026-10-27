@@ -1,0 +1,255 @@
+cd /home/squire/uchu_v3 && python3 - <<'EOF'
+p='uchu/calibration/fit_hardware.py'; s=open(p).read()
+old='''    if cfg.orbital.orbit_type == OrbitType.DEEP:
+        out["sun_projected_fraction"] = max(Q_sun / (tc.absorptance * tc.solar_flux_w_m2 * A), 0.0)
+        return out, w'''
+new='''    if cfg.orbital.orbit_type == OrbitType.DEEP:
+        out["sun_projected_fraction"] = max(Q_sun / (tc.absorptance * tc.solar_flux_w_m2 * A), 0.0)
+        if out["sun_projected_fraction"] > 1.0:
+            w.append(f"sunlit load implies a projected-area fraction of {out['sun_projected_fraction']:.2f} > 1: telemetry "
+                     f"contains a heat source the model lacks (self-heating, harness, other units)")
+        return out, w'''
+assert old in s; s=s.replace(old,new)
+old2='''    if fsun < 0:
+        w.append("sunlit-minus-eclipse load smaller than the albedo term: sun_projected_fraction clamped to 0")
+        fsun = 0.0'''
+new2='''    if fsun < 0:
+        w.append("sunlit-minus-eclipse load smaller than the albedo term: sun_projected_fraction clamped to 0")
+        fsun = 0.0
+    if fsun > 1.0:
+        w.append(f"sunlit load implies a projected-area fraction of {fsun:.2f} > 1: telemetry contains a heat source the model lacks")'''
+assert old2 in s; s=s.replace(old2,new2)
+open(p,'w').write(s)
+EOF
+cat > tests/test_cal_hardware.py <<'EOF'
+import math
+
+import numpy as np
+import pytest
+
+from uchu import DType, LumpedThermalModel, PowerModel, SimConfig, make_rng
+from uchu.calibration import fit_hardware as FH
+from uchu.calibration.data import CalibrationDataError, PerfMeasurement, PowerMeasurement, ThermalSample
+from uchu.calibration.fit_hardware import (apply_perf_fit, apply_power_fit, apply_thermal_fit, design_coverage,
+                                           fit_performance, fit_power_model, fit_thermal_model, integrate_thermal,
+                                           power_to_config_values, regime_counts, suggest_gemm_shapes,
+                                           suggest_power_design, thermal_to_config_values)
+from uchu.calibration.registry import placeholder_audit
+from uchu.calibration.synthetic import analyst_start_config, gen_perf, gen_power, gen_thermal, make_truth_config
+from uchu.config import OrbitalConfig, OrbitType, ProcessNode
+from uchu.memory import WorkloadLayer, estimate_layer
+from uchu.thermal import SIGMA_SB
+
+TRUTH = make_truth_config()
+
+
+# ====================================================================== power
+def test_power_design_is_well_conditioned_and_exactly_recovered_without_noise():
+    meas = gen_power(TRUTH, make_rng(1, "p"), rel_noise=0.0)
+    f = fit_power_model(meas, SimConfig(), make_rng(2, "f"))
+    assert f.config_values["base_power_w"] == pytest.approx(63.0, rel=1e-6)
+    assert f.config_values["static_frac"] == pytest.approx(0.38, rel=1e-6)
+    assert f.config_values["leak_temp_coeff"] == pytest.approx(3.1, rel=1e-5)
+    assert f.config_values["clock_frac"] == pytest.approx(0.12, rel=1e-4)
+    assert f.rel_rms_error < 1e-9 and f.cond < 1e3
+
+
+def test_power_fit_with_noise_brackets_truth_and_reproduces_the_model():
+    f = fit_power_model(gen_power(TRUTH, make_rng(3, "p"), 0.01), SimConfig(), make_rng(2, "f"))
+    for k, v in (("base_power_w", 63.0), ("static_frac", 0.38), ("leak_temp_coeff", 3.1), ("clock_frac", 0.12)):
+        assert f.ci95[k][0] <= v <= f.ci95[k][1], k
+    assert 0.003 < f.rel_rms_error < 0.02                       # ~ the injected 1 % noise
+    c = SimConfig(); apply_power_fit(c, f, "bench"); c.validate()
+    pm_fit, pm_true = PowerModel(c), PowerModel(TRUTH)
+    for T, fr, v, u in ((300, 1.5, 0.9, 1.0), (350, 0.9, 0.72, 0.4), (330, 1.2, 0.8, 0.0)):
+        assert pm_fit.power_w(T, fr, v, u) == pytest.approx(pm_true.power_w(T, fr, v, u), rel=0.03)
+    assert c.calibration["power.base_power_w"]["status"] == "measured"
+    assert "power.interconnect_frac" in placeholder_audit(c).unresolved           # honestly NOT claimed
+
+
+def test_power_inversion_is_exact_for_a_non_reference_chip():
+    t = SimConfig(); t.compute.array_size = 128; t.compute.area_mm2 = 250.0; t.compute.process_node = ProcessNode.N5
+    t.dvfs.nom_voltage_v = 0.85; t.power.base_power_w = 48.0; t.power.static_frac = 0.33
+    pm = PowerModel(t)
+    meas = [PowerMeasurement(d["T_k"], 1.5 * d["f_frac"], 0.85 * d["v_frac"], d["util"],
+                             pm.power_w(d["T_k"], 1.5 * d["f_frac"], 0.85 * d["v_frac"], d["util"])) for d in suggest_power_design()]
+    start = SimConfig(); start.compute = type(t.compute)(**vars(t.compute)); start.dvfs.nom_voltage_v = 0.85
+    f = fit_power_model(meas, start, make_rng(2, "f"))
+    assert f.config_values["base_power_w"] == pytest.approx(48.0, rel=1e-6) and f.config_values["static_frac"] == pytest.approx(0.33, rel=1e-6)
+    assert power_to_config_values(t, pm.static_nom_w, pm.dynamic_nom_w) == pytest.approx((48.0, 0.33))
+    apply_power_fit(start, f, "bench")
+    pm2 = PowerModel(start)
+    assert pm2.static_nom_w == pytest.approx(pm.static_nom_w, rel=1e-6) and pm2.dynamic_nom_w == pytest.approx(pm.dynamic_nom_w, rel=1e-6)
+
+
+def test_power_fit_refuses_unidentifiable_and_too_small_designs():
+    one = [PowerMeasurement(300.0, 1.5, 0.9, 1.0, 50.0 + 0.01 * i) for i in range(12)]    # same operating point repeated
+    with pytest.raises(CalibrationDataError, match="cannot identify"):
+        fit_power_model(one, SimConfig(), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match=">= 8"):
+        fit_power_model(gen_power(TRUTH, make_rng(1, "p"))[:7], SimConfig(), make_rng(0, "f"))
+
+
+@pytest.mark.slow
+def test_power_wald_interval_coverage():
+    R, hit = 40, {"base_power_w": 0, "static_frac": 0, "leak_temp_coeff": 0}
+    tv = {"base_power_w": 63.0, "static_frac": 0.38, "leak_temp_coeff": 3.1}
+    for i in range(R):
+        f = fit_power_model(gen_power(TRUTH, make_rng(500 + i, "p"), 0.01), SimConfig(), make_rng(i, "f"), n_draw=300)
+        for k in hit:
+            hit[k] += f.ci95[k][0] <= tv[k] <= f.ci95[k][1]
+    assert all(v / R >= 0.82 for v in hit.values()), hit
+
+
+# ====================================================================== thermal
+def test_newton_integrator_matches_lumped_model_exactly():
+    c = SimConfig(); th = LumpedThermalModel(c); th.T = 285.0
+    orb_t = np.arange(0, 6000 + 1, 30.0); P = 30 + 20 * np.sin(orb_t / 400.0) ** 2
+    ecl = (orb_t % 5739.0) < 2100.0
+    ref = [285.0]
+    for i in range(1, len(orb_t)):
+        th.step(30.0, lambda T, p=P[i]: p, bool(ecl[i])); ref.append(th.T)
+    kr = c.thermal.emissivity * SIGMA_SB * c.thermal.view_factor * c.thermal.radiator_area_m2
+    mine = integrate_thermal(c.thermal.capacitance_j_per_k, kr, th.env_load_w(False), th.env_load_w(True), orb_t, P, ecl, 285.0)
+    assert mine == pytest.approx(np.array(ref), abs=1e-7)
+
+
+def test_thermal_fit_recovers_truth_and_reproduces_telemetry():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    f = fit_thermal_model(tel, SimConfig(), make_rng(2, "f"))
+    tv = {"capacitance_j_per_k": 320.0, "radiator_area_m2": 0.21, "earth_view_fraction": 0.32, "sun_projected_fraction": 0.22}
+    for k, v in tv.items():
+        assert f.ci95[k][0] <= v <= f.ci95[k][1], k
+        assert f.config_values[k] == pytest.approx(v, rel=0.03), k
+    assert f.rms_K == pytest.approx(0.3, abs=0.05) and f.cond < 1e4 and f.fixed == []
+    c = SimConfig(); apply_thermal_fit(c, f, "flight telemetry")
+    # the calibrated config reproduces the loads and radiation coefficient that were fitted
+    lm = LumpedThermalModel(c)
+    assert lm.env_load_w(False) == pytest.approx(f.Q_sun, rel=1e-9) and lm.env_load_w(True) == pytest.approx(f.Q_ecl, rel=1e-9)
+    assert lm.radiated_w(300.0) == pytest.approx(f.kr * 300.0 ** 4, rel=1e-9)
+    st = placeholder_audit(c)
+    assert "thermal.albedo_geometry" in st.resolved and c.calibration["thermal.albedo_geometry"]["status"] == "absorbed"
+
+
+def test_thermal_fit_without_eclipse_leaves_those_parameters_unresolved():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    k0 = next(i for i, r in enumerate(tel) if i > 0 and not r.eclipse)
+    k1 = next(i for i in range(k0, len(tel)) if tel[i].eclipse)
+    sunlit = [ThermalSample(r.t_s - tel[k0 - 1].t_s, r.power_w, False, r.T_k) for r in tel[k0 - 1:k1]]
+    sunlit[0] = ThermalSample(0.0, 0.0, False, sunlit[0].T_k)
+    f = fit_thermal_model(sunlit, SimConfig(), make_rng(2, "f"))
+    assert f.fixed == ["Q_ecl"] and any("no eclipse samples" in w for w in f.warnings)
+    c = SimConfig(); before = c.thermal.earth_view_fraction
+    apply_thermal_fit(c, f, "partial telemetry")
+    assert c.thermal.earth_view_fraction == before and "thermal.earth_view_fraction" in placeholder_audit(c).unresolved
+
+
+def test_thermal_fit_refuses_uninformative_telemetry():
+    tel = gen_thermal(TRUTH, make_rng(1, "t"))
+    flat = [ThermalSample(r.t_s, 40.0, r.eclipse, r.T_k) for r in tel]           # constant power: C not identifiable
+    with pytest.raises(CalibrationDataError, match="cannot identify"):
+        fit_thermal_model(flat, SimConfig(), make_rng(0, "f"))
+    with pytest.raises(CalibrationDataError, match=">= 20"):
+        fit_thermal_model(tel[:10], SimConfig(), make_rng(0, "f"))
+
+
+def test_thermal_mapping_clamps_and_warns_on_unphysical_loads():
+    c = SimConfig()
+    v, w = thermal_to_config_values(c, 300.0, 1e-9, 40.0, 5.0)
+    assert 0 <= v["earth_view_fraction"] <= 1 and not w
+    v, w = thermal_to_config_values(c, 300.0, 1e-9, 1.0, 50.0)          # sunlit load < eclipse load
+    assert v["sun_projected_fraction"] == 0.0 and any("clamped" in x for x in w)
+    v, w = thermal_to_config_values(c, 300.0, 1e-9, 20.0, 5000.0)       # eclipse load implies Earth fraction > 1
+    assert v["earth_view_fraction"] == 1.0 and any("> 1" in x for x in w)
+    d = SimConfig(); d.orbital = OrbitalConfig.for_orbit(OrbitType.DEEP)
+    v, w = thermal_to_config_values(d, 300.0, 2e-9, 15.0, 0.0)
+    assert "earth_view_fraction" not in v and any("heat source" in x for x in w)
+
+
+def test_radiator_area_maps_from_radiation_coefficient_with_degradation():
+    c = SimConfig(); c.thermal.mission_year = 10.0
+    v, _ = thermal_to_config_values(c, 300.0, 3e-9, 40.0, 10.0)
+    F = 0.85 * (1 - 0.02 * 10.0)
+    assert v["radiator_area_m2"] == pytest.approx(3e-9 / (SIGMA_SB * 0.85 * F), rel=1e-12)
+
+
+# ====================================================================== performance
+def _measure(truth, start, seed, shapes=None, **kw):
+    return gen_perf(truth, start, make_rng(seed, "c"), shapes=shapes, **kw)
+
+
+def test_perf_fit_recovers_all_three_parameters_and_launch_overhead():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5), start, make_rng(4, "f"))
+    tv = {"pipeline_overlap": 0.6, "hbm_efficiency": 0.72, "sparse_speedup_at_50": 1.7}
+    for k, v in tv.items():
+        assert f.ci95[k][0] <= v <= f.ci95[k][1] and f.params[k] == pytest.approx(v, rel=0.08), k
+    assert f.t_launch_s == pytest.approx(8e-6, rel=0.2) and f.fixed == [] and f.cond < 100
+    assert f.log_rms == pytest.approx(0.02, abs=0.01)
+
+
+def test_perf_fit_noise_free_is_exact():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5, log_noise=0.0), start, make_rng(4, "f"))
+    assert f.params["pipeline_overlap"] == pytest.approx(0.6, rel=1e-4) and f.params["hbm_efficiency"] == pytest.approx(0.72, rel=1e-4)
+    assert f.params["sparse_speedup_at_50"] == pytest.approx(1.7, rel=1e-4) and f.t_launch_s == pytest.approx(8e-6, rel=1e-3)
+
+
+def test_missing_regime_is_left_unresolved_not_guessed():
+    start = analyst_start_config(TRUTH)
+    dense_only = [s for s in suggest_gemm_shapes(start) if s["sparsity"] == 0.0]
+    f = fit_performance(_measure(TRUTH, start, 5, shapes=dense_only), start, make_rng(4, "f"))
+    assert "sparse_speedup_at_50" in f.fixed and f.params["sparse_speedup_at_50"] == start.compute.sparse_speedup_at_50
+    assert any("kept at its placeholder" in w for w in f.warnings)
+    c = analyst_start_config(TRUTH); apply_perf_fit(c, f, "bench")
+    assert c.compute.sparse_speedup_at_50 == 1.85 and "compute.sparse_speedup_at_50" in placeholder_audit(c).unresolved
+    assert "memory.hbm_efficiency" in placeholder_audit(c).resolved
+
+
+def test_zero_sensitivity_parameter_is_dropped_instead_of_failing():
+    start = analyst_start_config(TRUTH)
+    # sparse shapes that are strongly memory-bound at the fitted bandwidth carry no information about the compute speedup
+    A = start.compute.array_size
+    shapes = [dict(M=1, K=16 * A, N=16 * A, dtype="int8", sparsity=0.5)] * 3 + suggest_gemm_shapes(start)[:10]
+    f = fit_performance(_measure(TRUTH, start, 6, shapes=shapes), start, make_rng(4, "f"))
+    assert f.params["pipeline_overlap"] == pytest.approx(0.6, abs=0.15)                # the others still fit
+    assert "sparse_speedup_at_50" in f.fixed
+
+
+def test_perf_apply_notes_that_ecc_overhead_is_absorbed():
+    start = analyst_start_config(TRUTH)
+    f = fit_performance(_measure(TRUTH, start, 5), start, make_rng(4, "f"))
+    c = analyst_start_config(TRUTH); apply_perf_fit(c, f, "bench")
+    assert c.calibration["memory.ecc_bw_overhead_pct"]["status"] == "absorbed"
+    assert c.memory.hbm_efficiency == f.params["hbm_efficiency"] and any("absorbs the ECC" in w for w in f.warnings)
+
+
+def test_perf_input_checks():
+    start = analyst_start_config(TRUTH)
+    with pytest.raises(CalibrationDataError, match=">= 8"):
+        fit_performance(_measure(TRUTH, start, 5)[:5], start, make_rng(0, "f"))
+
+
+def test_design_coverage_is_chip_specific_and_predicts_identifiability():
+    slow = analyst_start_config(TRUTH)
+    cov = design_coverage(slow)
+    assert all(v >= 3 for v in cov.values())
+    fast = SimConfig()                      # 2 TB/s: GEMMs never bandwidth-limited -> hbm_efficiency unobservable
+    assert design_coverage(fast)["hbm_efficiency"] == 0
+    meas = [PerfMeasurement(s["M"], s["K"], s["N"], s["dtype"], s["sparsity"], 1.5, 1e-3) for s in suggest_gemm_shapes(slow)]
+    assert regime_counts(meas, slow)["pipeline_overlap"] >= 3
+
+
+def test_suggested_designs_have_expected_structure():
+    d = suggest_power_design()
+    assert len(d) == 18 and {x["util"] for x in d} == {0.0, 0.5, 1.0} and len({x["T_k"] for x in d}) == 3
+    shapes = suggest_gemm_shapes(SimConfig())
+    assert any(s["sparsity"] == 0.5 for s in shapes) and any(s["M"] == 1 for s in shapes)
+    A = 256
+    assert min(s["K"] for s in shapes) == A // 4 and any(s["M"] == s["N"] == s["K"] == A // 2 for s in shapes)
+EOF
+python3 -m pytest tests/test_cal_hardware.py -q -p no:cacheprovider -m "not slow" 2>&1 | tail -30
+
+Response:
+
+{"returncode":0,"stdout":"        tv = {\"pipeline_overlap\": 0.6, \"hbm_efficiency\": 0.72, \"sparse_speedup_at_50\": 1.7}\n        for k, v in tv.items():\n            assert f.ci95[k][0] <= v <= f.ci95[k][1] and f.params[k] == pytest.approx(v, rel=0.08), k\n        assert f.t_launch_s == pytest.approx(8e-6, rel=0.2) and f.fixed == [] and f.cond < 100\n>       assert f.log_rms == pytest.approx(0.02, abs=0.01)\nE       assert 0.033651923414934136 == 0.02 ± 0.01\nE         \nE         comparison failed\nE         Obtained: 0.033651923414934136\nE         Expected: 0.02 ± 0.01\n\ntests/test_cal_hardware.py:164: AssertionError\n______________________ test_perf_fit_noise_free_is_exact _______________________\n\n    def test_perf_fit_noise_free_is_exact():\n        start = analyst_start_config(TRUTH)\n        f = fit_performance(_measure(TRUTH, start, 5, log_noise=0.0), start, make_rng(4, \"f\"))\n>       assert f.params[\"pipeline_overlap\"] == pytest.approx(0.6, rel=1e-4) and f.params[\"hbm_efficiency\"] == pytest.approx(0.72, rel=1e-4)\nE       assert (0.5872170314623248 == 0.6 ± 6.0e-05\nE         \nE         comparison failed\nE         Obtained: 0.5872170314623248\nE         Expected: 0.6 ± 6.0e-05)\n\ntests/test_cal_hardware.py:170: AssertionError\n=========================== short test summary info ============================\nFAILED tests/test_cal_hardware.py::test_thermal_fit_recovers_truth_and_reproduces_telemetry\nFAILED tests/test_cal_hardware.py::test_thermal_mapping_clamps_and_warns_on_unphysical_loads\nFAILED tests/test_cal_hardware.py::test_perf_fit_recovers_all_three_parameters_and_launch_overhead\nFAILED tests/test_cal_hardware.py::test_perf_fit_noise_free_is_exact - assert...\n","stderr":""}
